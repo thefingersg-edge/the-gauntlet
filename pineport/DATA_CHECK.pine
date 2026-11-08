@@ -1,0 +1,64 @@
+//@version=6
+// =============================================================================
+// DATA LOADING CHECK
+//
+// This is an INDICATOR, not a strategy. No orders, no position, no sizing, no
+// exits, no ta.* calls that carry state. It cannot be affected by anything in
+// the trading logic. All it does is report what data TradingView actually gave
+// the script.
+//
+// HOW TO USE
+//   1. Add it to the same gold chart at the same timeframe.
+//   2. Read the label at the right-hand edge.
+//   3. Change to your other backtest range and read it again.
+//
+// WHAT IT MEANS
+//   "bars loaded" or "first bar" DIFFER between the two ranges
+//       -> TradingView is feeding the script different data. No script change
+//          can fix this, and it fully explains why even a bare SMA crossover
+//          gave different trades. Fix by enabling Deep Backtesting, or accept
+//          that the chart cannot hold the history you are testing over.
+//
+//   Both IDENTICAL
+//       -> the data is the same, so the difference is created by the strategy
+//          engine (order fills, sizing, position carry-in), not the data, and
+//          I will look there next.
+//
+// REFERENCE (what the full history should be, from the OANDA feed):
+//       15m : 485,843 bars   from 2006-03-20
+//       1H  : 122,765 bars   from 2006-03-19
+//   A Premium chart typically loads ~20,000 bars, which at 15m is ~208 days.
+// =============================================================================
+
+indicator("Data loading check", overlay=true)
+
+var int  barsLoaded = 0
+var int  firstTime  = time
+barsLoaded += 1
+
+// Bars actually inside the last 365 days, for comparison against the total
+var int  barsIn365 = 0
+if time > timenow - 365 * 24 * 60 * 60 * 1000
+    barsIn365 += 1
+
+if barstate.islast
+    txt = str.format(
+       "symbol      {0}\ntimeframe   {1}\n\nbars loaded {2}\nfirst bar   {3}\nlast bar    {4}\nbars in 365d {5}",
+       syminfo.tickerid,
+       timeframe.period,
+       str.tostring(barsLoaded),
+       str.format_time(firstTime, "yyyy-MM-dd HH:mm", syminfo.timezone),
+       str.format_time(time,      "yyyy-MM-dd HH:mm", syminfo.timezone),
+       str.tostring(barsIn365))
+    label.new(bar_index, high, txt,
+              style     = label.style_label_left,
+              textalign = text.align_left,
+              size      = size.normal,
+              color     = color.new(color.blue, 85),
+              textcolor = color.white)
+
+// Also exported to the Data Window so you can diff two runs numerically
+D = display.data_window
+plot(barsLoaded, "bars_loaded", display=D)
+plot(bar_index,  "bar_index",   display=D)
+plot(barsIn365,  "bars_in_365d", display=D)

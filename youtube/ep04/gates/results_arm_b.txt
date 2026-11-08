@@ -1,0 +1,34 @@
+
+=== ARM B (path continuity) — cleared 2 of 7 ===
+    trades 4096  markets 21
+  [FAIL] 1 SIGN CONSISTENCY
+          by_era: {'E1': 0.00242, 'E2': -0.00287, 'E3': -0.00114}
+          n_by_era: {'E1': 1363, 'E2': 1357, 'E3': 1376}
+  [FAIL] 2 BREADTH
+          positive: 7
+          traded: 21
+          universe: 21
+          per_market: {'audusd': -0.00148, 'bcousd': 0.00152, 'cornusd': 0.00062, 'de10ybeur': -0.00317, 'de30eur': -0.00149, 'eurgbp': -0.00258, 'eurjpy': -0.00086, 'eurusd': -0.00201, 'gbpusd': -0.00161, 'nas100usd': 0.00574, 'natgasusd': 0.00563, 'spx500usd': 0.00115, 'sugarusd': -0.00151, 'usb10yusd': -0.00291, 'usdcad': -0.00293, 'usdjpy': -0.00133, 'wheatusd': -0.01154, 'xagusd': -0.00097, 'xauusd': 0.00279, 'xcuusd': 0.00565, 'xptusd': -0.00206}
+  [FAIL] 3 EFFECT SIZE
+          mean_net_per_trade: -0.00053
+          mean_gross_per_trade: 0.00232
+          mean_cost_per_trade: 0.00285
+          threshold: 0.002
+  [PASS] 4 SAMPLE
+          n: 4096
+          threshold: 200
+  [FAIL] 5 ROBUSTNESS
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: -0.00053
+          note: not applicable: base edge is not positive
+  [FAIL] 6 MATCHED CONTROL
+          edge_vs_control: -0.00139
+          n_matched: 3729
+          coverage: 91% of 4096 trades
+  [PASS] 7 DAILY RISK
+          measured_daily_max_dd: -46.3%
+          claimed_by_strategy: no claim made
+          resolution: daily close, open positions marked
+          note: nothing was concealed because nothing was claimed
+
+    equity 10,000 -> 13,147   CAGR 1.3%   daily max DD -46.3%

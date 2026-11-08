@@ -1,0 +1,126 @@
+//@version=6
+// =============================================================================
+// RANGE-DEPENDENCE BISECTOR
+//
+// Purpose: find WHICH component makes the trade list depend on the backtest
+// range. Two guesses have already failed, so this stops guessing and isolates
+// it by construction.
+//
+// HOW TO USE
+//   1. Put this on the same 15m gold chart.
+//   2. Set "Stage" to 0. Note the total trade count over your FULL range and
+//      over 365 days.
+//   3. If they MATCH, raise Stage by 1 and repeat.
+//   4. The first Stage where the two counts DIVERGE contains the cause.
+//
+//   Stage 0  bare BB entry + fixed % stop        (no state at all)
+//   Stage 1  + RSI cross and the SMA state filter
+//   Stage 2  + squeeze
+//   Stage 3  + ADX and volatility gates
+//   Stage 4  + FRED real-yield filter
+//   Stage 5  + equity-based position sizing
+//   Stage 6  + trailing stop and profit ladder
+//
+// WHAT EACH RESULT MEANS
+//   Diverges at Stage 0  -> nothing to do with your logic. The chart is not
+//                           loading the same bars. Check Deep Backtesting and
+//                           your plan's bar limit (20y of 15m = 485,843 bars).
+//   Diverges at Stage 4  -> request.security / FRED availability.
+//   Diverges at Stage 5  -> equity-driven qty; orders being rejected or resized.
+//   Diverges at Stage 6  -> remaining state in the trailing stop.
+//
+// Every ta.* call is at global scope, so no stage can be affected by v6 lazy
+// evaluation, and there are no dynamic close[] offsets anywhere.
+// =============================================================================
+
+strategy("Range bisector", shorttitle="RANGE TEST", overlay=true,
+         initial_capital=6000, pyramiding=0)
+
+stage = input.int(0, "Stage", minval=0, maxval=6)
+
+// ----------------------------------------------------------------- indicators
+BBlengthL = input.int(94,     "BB Period L")
+BBmultL   = input.float(1.13, "BB Stdev L")
+bbLower   = ta.vwma(close, BBlengthL) - BBmultL * ta.stdev(close, BBlengthL)
+buyEntry  = ta.crossover(close, bbLower)
+
+vrsiL      = ta.rsi(close, 16)
+rsiCrossUp = ta.crossover(vrsiL, 54)
+LSMAL      = ta.sma(close, 49)
+smaState   = close > LSMAL
+
+upperBB = ta.vwma(close, 5)  + 2.5 * ta.stdev(close, 5)
+lowerBB = ta.vwma(close, 10) - 2.5 * ta.stdev(close, 10)
+rng     = ta.tr(true)
+upperKC = ta.vwma(close, 10) + ta.vwma(rng, 10) * 2.5
+lowerKC = ta.vwma(close, 18) - ta.vwma(rng, 18) * 2.5
+sqzOn   = (lowerBB > lowerKC) and (upperBB < upperKC)
+valL    = ta.linreg(close - math.avg(math.avg(ta.highest(high, 10), ta.lowest(low, 10)), ta.vwma(close, 10)), 10, 0)
+sqzUp   = sqzOn and (valL > 0)
+
+[pdi, mdi, adxv] = ta.dmi(6, 4)
+adxOK = adxv > 24
+atrL  = ta.atr(3)
+volOK = atrL > ta.sma(atrL, 7)
+
+[realYield, realYieldMA] = request.security("FRED:DFII10", "D", [close, ta.sma(close, 26)], barmerge.gaps_off, barmerge.lookahead_off)
+ratesBull = realYield < realYieldMA
+
+// ----------------------------------------------------------------- entry
+sig = buyEntry
+sig := stage >= 1 ? (sig and rsiCrossUp and smaState) : sig
+sig := stage >= 2 ? (sig and sqzUp)                   : sig
+sig := stage >= 3 ? (sig and adxOK and volOK)         : sig
+sig := stage >= 4 ? (sig and ratesBull)               : sig
+
+qty = 1.0
+qty := stage >= 5 ? math.ceil((strategy.equity * 0.8 / 100) / (50 * syminfo.pointvalue)) : qty
+
+if sig
+    strategy.entry("L", strategy.long, qty=qty)
+
+// ----------------------------------------------------------------- exit
+// Stage 0-5: a plain fixed percentage stop, no state whatsoever.
+// Stage 6: the trailing stop and ladder from the real script.
+var float entryClose = 0.0
+bought = strategy.position_size > strategy.position_size[1]
+if bought
+    entryClose := close
+
+lastEntry = strategy.opentrades.entry_price(strategy.opentrades - 1)
+
+simpleStop = 0.0
+trailStop  = 0.0
+targetL    = 0.0
+
+if (strategy.position_size > 0)
+    simpleStop := close - close * 2.94 / 100
+    targetL    := entryClose + entryClose * (3.14 / 100) * 3.0
+    trailStop  := simpleStop
+    if ta.crossover(close, targetL)
+        trailStop := targetL * 0.95
+    if ta.crossover(close, lastEntry + 170)
+        trailStop := lastEntry + 170
+    if ta.crossover(close, lastEntry + 170 + 60)
+        trailStop := lastEntry + 170 + 60
+    if ta.crossover(close, lastEntry + 170 + 120)
+        trailStop := lastEntry + 170 + 120
+    trailStop := math.max(trailStop, trailStop[1])
+
+useStop = stage >= 6 ? trailStop : simpleStop
+
+if (strategy.position_size > 0)
+    strategy.exit("X", from_entry="L", stop=useStop)
+
+// ----------------------------------------------------------------- diagnostics
+D = display.data_window
+var int firstBar = bar_index
+plot(firstBar,                    "d_firstBar",  display=D)
+plot(bar_index,                   "d_barIndex",  display=D)
+plot(na(realYield) ? 0 : 1,       "d_fredOK",    display=D)
+plot(ratesBull ? 1 : 0,           "d_ratesBull", display=D)
+plot(qty,                         "d_qty",       display=D)
+plot(strategy.equity,             "d_equity",    display=D)
+plot(sig ? 1 : 0,                 "d_signal",    display=D)
+plot(useStop,                     "d_stop",      display=D)
+plotchar(strategy.opentrades, "opentrades", "", location.top)

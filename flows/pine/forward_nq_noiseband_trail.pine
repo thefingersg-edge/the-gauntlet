@@ -1,0 +1,145 @@
+//@version=6
+strategy("NQ noise band + trailing stop (curiosity variant)", shorttitle = "NQ trail", overlay = true,
+     initial_capital = 1000000, default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 1.25,
+     slippage = 1, margin_long = 100, margin_short = 100, pyramiding = 0)
+
+// =====================================================================
+// flows/PREREGISTRATION_FORWARD_NQ.md: fastbot v36 rule N, unchanged, on CME
+// Nasdaq-100 E-mini futures. Use on CME_MINI:NQ1!, 5-minute chart, with
+// extended hours shown (the rule reads New York clock times itself).
+// Costs as registered: one tick slippage per fill + $1.25 per contract per
+// side ($2.50 round trip). One contract, unlevered P&L in the Strategy Tester.
+//
+// CURIOSITY VARIANT (2026-10-11): the same rule plus a trailing stop that starts
+// TRAIL points from the entry fill and keeps that gap behind the best price
+// since entry (the highest high for a long, the lowest low for a short). It
+// never loosens. NOT part of FORWARD_NQ and NOT pre-registered: anything you see
+// here is in-sample curiosity, and the forward record keeps the unchanged rule.
+// NQ: 1 index point = $20 per contract, so 100 points = $2,000 per contract;
+// $100 per contract would be 5 points.
+//
+// A VISUALISATION ONLY. It sends no orders and is not connected to a broker.
+// The record is flows/data/forward_nq.csv (Databento NQ.v.0), not this
+// chart: TradingView's NQ1! rolls on its own schedule and fills on its own
+// model, so trades near a roll or on gappy bars can differ.
+// I am not a financial adviser. Measurement, not a recommendation.
+// =====================================================================
+
+LOOKBACK = input.int(14, "Lookback sessions (frozen: 14)", minval = 10, maxval = 60)
+USE_TRAIL = input.bool(true, "Trailing stop on")
+TRAIL = input.float(100.0, "Trailing gap, index points (100 pts = $2,000/contract)", minval = 0.25, step = 0.25)
+TZ   = "America/New_York"
+NCHK = 12                                   // bars closing 10:00, 10:30 ... 15:30
+
+var array<float> hist  = array.new_float(NCHK * 60, na)
+var array<float> today = array.new_float(NCHK, na)
+var int   nDays     = 0
+var float dayOpen   = na
+var float prevClose = na
+var float lastClose = na
+var float twapSum   = 0.0
+var int   twapN     = 0
+var int   side      = 0
+var float upperB    = na
+var float lowerB    = na
+
+if timeframe.period != "5"
+    runtime.error("Use a 5-minute CME_MINI:NQ1! chart: the v36 rule is defined on 5m bars.")
+
+barMin = hour(time, TZ) * 60 + minute(time, TZ)       // bar START, New York
+inRTH  = barMin >= 570 and barMin <= 955               // 09:30 .. 15:55 bars
+
+// ---- a new cash session: bank yesterday's moves, reset the day ----
+if barMin == 570
+    if not na(dayOpen)
+        slot = nDays % LOOKBACK
+        for k = 0 to NCHK - 1
+            array.set(hist, slot * NCHK + k, array.get(today, k))
+        nDays += 1
+    prevClose := lastClose
+    lastClose := na
+    dayOpen   := open
+    twapSum   := 0.0
+    twapN     := 0
+    side      := 0
+    upperB    := na
+    lowerB    := na
+    for k = 0 to NCHK - 1
+        array.set(today, k, na)
+    if strategy.position_size != 0
+        strategy.close_all(comment = "stale", immediately = true)
+
+// ---- session average price (time-weighted, as registered) ----
+if inRTH and not na(dayOpen)
+    twapSum += hlc3
+    twapN   += 1
+twap = twapN > 0 ? twapSum / twapN : na
+
+// ---- checkpoints: the bars whose close is 10:00, 10:30 ... 15:30 ----
+isChk = inRTH and barMin >= 595 and barMin <= 925 and (barMin - 595) % 30 == 0
+if isChk and not na(dayOpen)
+    k = int(math.floor((barMin - 595) / 30))
+    array.set(today, k, math.abs(close / dayOpen - 1))
+    float s = 0.0
+    int   c = 0
+    for j = 0 to LOOKBACK - 1
+        v = array.get(hist, j * NCHK + k)
+        if not na(v)
+            s += v
+            c += 1
+    sig = c >= 10 and nDays >= LOOKBACK ? s / c : na
+    if not na(sig) and not na(prevClose)
+        upperB := math.max(dayOpen, prevClose) * (1 + sig)
+        lowerB := math.min(dayOpen, prevClose) * (1 - sig)
+        if side == 1 and close < math.max(upperB, twap)
+            strategy.close("Long", comment = "stop")
+            side := 0
+        else if side == -1 and close > math.min(lowerB, twap)
+            strategy.close("Short", comment = "stop")
+            side := 0
+        if side == 0
+            if close > upperB
+                strategy.entry("Long", strategy.long)
+                side := 1
+            else if close < lowerB
+                strategy.entry("Short", strategy.short)
+                side := -1
+
+// ---- flat at the 15:55 bar's close ----
+if barMin == 955
+    lastClose := close
+    if strategy.position_size != 0
+        strategy.close_all(comment = "15:55 close", immediately = true)
+    side := 0
+
+// ---- trailing stop: starts TRAIL from the fill, follows the best price, never loosens ----
+var float best = na
+var float trailStop = na
+var int   trailDir  = 0
+posDir = int(math.sign(strategy.position_size))
+if posDir != trailDir                      // flat, new trade, or a reversal: start a fresh trail
+    best := na
+    trailStop := na
+    trailDir := posDir
+if posDir != 0 and USE_TRAIL
+    if na(best)
+        best := strategy.position_avg_price
+    if posDir > 0
+        best := math.max(best, high)
+        trailStop := na(trailStop) ? best - TRAIL : math.max(trailStop, best - TRAIL)
+        strategy.exit("Trail L", from_entry = "Long", stop = trailStop, comment = "trail")
+    else
+        best := math.min(best, low)
+        trailStop := na(trailStop) ? best + TRAIL : math.min(trailStop, best + TRAIL)
+        strategy.exit("Trail S", from_entry = "Short", stop = trailStop, comment = "trail")
+
+plot(USE_TRAIL and strategy.position_size != 0 ? trailStop : na, "Trailing stop", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+plot(inRTH ? upperB : na, "Upper band", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 2)
+plot(inRTH ? lowerB : na, "Lower band", color = color.new(color.maroon, 0), style = plot.style_linebr, linewidth = 2)
+plot(inRTH ? twap : na, "Session average (TWAP)", color = color.new(color.gray, 30), style = plot.style_linebr)
+bgcolor(isChk ? color.new(color.blue, 92) : na, title = "Checkpoint bars")
+
+// ---- the forward record starts 2026-10-12: shade sessions before it ----
+fwdStart = timestamp(TZ, 2026, 10, 12, 0, 0)
+bgcolor(time < fwdStart and inRTH ? color.new(color.gray, 94) : na, title = "Before the forward record (backtest period)")

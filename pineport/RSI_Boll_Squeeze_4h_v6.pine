@@ -1,0 +1,369 @@
+//@version=6
+// =============================================================================
+// RSI Boll Squeeze Strategy -- Gold 4hr New
+// v5 -> v6 migration + dead-code removal. TRADING BEHAVIOUR IS UNCHANGED.
+//
+// CRITICAL v6 FIX
+//   v6 evaluates `and`/`or` lazily. In the v5 source the entry conditions read
+//       if (ta.crossover(vrsiL, RSIoverSold) and ta.crossover(sourceL, BBlower)) ...
+//   Under v6 the second ta.crossover() is SKIPPED on every bar where the first
+//   is false, so its internal history stops updating and the signal silently
+//   goes wrong. Every ta.* call is now hoisted to global scope and evaluated
+//   unconditionally. (The script already had unused `buyEntry` / `sellEntry`
+//   variables holding exactly these expressions -- they are now used, which
+//   both fixes v6 and removes a duplicated calculation.)
+//
+// REMOVED -- 32 identifiers that nothing read (verified by usage analysis)
+//   SMAShort / SMAPeriodS      declared, never referenced (1 x ta.sma)
+//   EMAShort / EMAPeriodS      declared, never referenced (1 x ta.ema)
+//   mult                       "BB MultFactor" -- unused, bands use multKC
+//   sqzOff, noSqz              computed, never read
+//   barssqzUp, barssqzDown     computed, never read (2 x ta.barssince)
+//   use_trailing_stop_loss     input, never read
+//   P1..P16                    plot() return values, never read
+//   duplicated crossover calls folded into buyEntry / sellEntry
+//   no-op arithmetic  ( *1 and /1 in the position sizing )
+//   long_position_size / short_position_size were identical -> one variable
+//
+// EFFICIENCY
+//   strategy.opentrades.entry_price(strategy.opentrades - 1) appeared 20 times.
+//   It is now evaluated once per bar as `lastEntry`.
+//   Net: 6 fewer indicator series and ~19 fewer per-bar function calls.
+//
+// EXPORT FIX (no behaviour change)
+//   13 plots were all titled "SL Long", which mangles CSV exports into
+//   "SL Long.1", "SL Long.2"... Every plot now has a distinct title.
+//
+// BEHAVIOUR PRESERVED DELIBERATELY -- see notes at the foot of this file.
+//   The ladder rungs stay unrolled (a for-loop would change ta.crossover
+//   history semantics), the long-stop asymmetry stays, and the take-profit
+//   stays disabled. These are flagged, not fixed.
+// =============================================================================
+
+// Execution model pinned to match the Python port -- see Gold_15m_v6_fixed.pine
+// for the full rationale. Every value is explicit, including defaults, because
+// a default that changes between Pine versions is how the 15m version silently
+// lost trades (v6 made margin_long/short default to 100, rejecting any entry
+// larger than account equity).
+strategy("RSI Boll Squeeze Strategy", shorttitle="Gold 4hr New", overlay=true,
+         initial_capital              = 2000,
+         margin_long                  = 0,
+         margin_short                 = 0,
+         pyramiding                   = 0,
+         commission_type              = strategy.commission.percent,
+         commission_value             = 0,
+         slippage                     = 0,
+         process_orders_on_close      = false,
+         fill_orders_on_standard_ohlc = true,
+         use_bar_magnifier            = false,
+         calc_on_every_tick           = false,
+         calc_on_order_fills          = false,
+         max_bars_back                = 1000)
+
+// ----------------------------------------------------------------- position sizing
+riskPercent  = input.float(1, "Risk % of equity", minval=0.0, step=0.1)
+cashRisk     = strategy.equity * riskPercent / 100
+positionSize = math.ceil(cashRisk / (50 * syminfo.pointvalue))
+
+// ----------------------------------------------------------------- entry filters
+RSIlengthL    = input.int(1,  "RSI Period LengthL")
+RSIlengthS    = input.int(3,  "RSI Period LengthS")
+RSIoverSold   = input.int(49, "Over Sold")
+RSIoverBought = input.int(43, "Under Sold")
+
+LSMAlengthL = input.int(3,  "LSMA Period LengthL")
+LSMAlengthS = input.int(1,  "LSMA Period LengthS")
+SSMAlengthL = input.int(3,  "SSMA Period LengthL")
+SSMAlengthS = input.int(13, "SSMA Period LengthS")
+
+adx_len     = input.int(9,  "ADX DI Length")
+adx_smooth  = input.int(45, "ADX Smoothing Length")
+adxVar      = input.int(21, "adx var")
+adx_lenS    = input.int(50, "ADX DI LengthS")
+adx_smoothS = input.int(1,  "ADX Smoothing LengthS")
+adxVarS     = input.int(30, "adx varS")
+
+// ----------------------------------------------------------------- stop shaping
+flexUp     = input.float(0.95,  "Limit Flex", step=0.001)
+flexDown   = input.float(0.95,  "Loss Flex",  step=0.001)
+gapUp      = input.float(0.995, "Gap reducer Up",   step=0.01)
+gapDown    = input.float(0.995, "Gap reducer Down", step=0.01)
+
+// NOTE: these two are NOT persistent stops. Pine re-runs the global scope every
+// bar, so each resets to the value below before the blocks underneath may
+// overwrite it. They act as per-bar seeds into math.max / math.min.
+seedStopLong  = input.float(0,       "Long stop seed (per bar)",  step=0.01)
+seedStopShort = input.float(1000000, "Short stop seed (per bar)", step=0.01)
+
+profitLineUp   = input.float(1,     "Profit Line Up",   step=1)
+profitLineDown = input.float(1,     "Profit Line Down", step=1)
+TraceLineUp    = input.float(0.001, "Trace Line Up",    step=0.01)
+TraceLineDown  = input.float(0.001, "Trace Line Down",  step=0.01)
+
+markUp         = input.int(470, "MarkUp")
+lockProfitUp   = input.int(470, "lockProfitUp")
+markDown       = input.int(880, "MarkDown")
+lockProfitDown = input.int(880, "lockProfitDown")
+rangeL         = input.int(950, "Range Long")
+rangeS         = input.int(340, "Range Short")
+
+SL_percent_basedL = input.float(5.79, "Loss % Stop MulitiplierL",  minval=0.0, step=0.1)
+L_percent_basedL  = input.float(3.14, "Limit % Stop MulitiplierL", minval=0.0, step=0.1)
+r_ratioL          = input.float(3,    "Risk Reward RatioL",        minval=0.0, step=0.1)
+SL_percent_basedS = input.float(3.93, "Loss % Stop MulitiplierS",  minval=0.0, step=0.1)
+L_percent_basedS  = input.float(5.09, "Limit % Stop MulitiplierS", minval=0.0, step=0.1)
+r_ratioS          = input.float(3,    "Risk Reward RatioS",        minval=0.0, step=0.1)
+
+// ----------------------------------------------------------------- squeeze
+lengthL      = input.int(90,    "BB Length L")
+lengthS      = input.int(9,     "BB Length S")
+lengthKCL    = input.int(14,    "KC Length L")
+lengthKCS    = input.int(5,     "KC Length S")
+multKC       = input.float(2.5, "KC MultFactor")
+longVal      = input.int(-38,   "Long Condition Value")
+shortVal     = input.int(42,    "Short Condition Value")
+useTrueRange = input.bool(true, "Use TrueRange (KC)")
+
+BBlengthL = input.int(5,      "Bollinger Period Length L",            minval=1)
+BBmultL   = input.float(0.51, "Bollinger Bands Standard Deviation L", minval=0.001, maxval=50)
+BBlengthS = input.int(35,     "Bollinger Period Length S",            minval=1)
+BBmultS   = input.float(1.17, "Bollinger Bands Standard Deviation S", minval=0.001, maxval=50)
+
+// =============================================================================
+// INDICATORS -- every ta.* call lives here, at global scope, evaluated on every
+// bar. Nothing below this block may introduce a new ta.* call inside a
+// conditional or on the right of an `and`/`or`.
+// =============================================================================
+price = close
+
+vrsiL = ta.rsi(price, RSIlengthL)
+vrsiS = ta.rsi(price, RSIlengthS)
+LSMAL = ta.sma(price, LSMAlengthL)
+LSMAS = ta.sma(price, LSMAlengthS)
+SSMAL = ta.sma(price, SSMAlengthL)
+SSMAS = ta.sma(price, SSMAlengthS)
+
+// plus_di / minus_di are unused but ta.dmi() returns a 3-tuple, so the slots
+// must be named. They cost nothing -- ta.dmi computes all three regardless.
+[plus_di,  minus_di,  adx_value]  = ta.dmi(adx_len,  adx_smooth)
+[plus_diS, minus_diS, adx_valueS] = ta.dmi(adx_lenS, adx_smoothS)
+trend_is_active  = adx_value  > adxVar
+trend_is_activeS = adx_valueS < adxVarS
+
+// Bollinger / Keltner squeeze
+upperBB = ta.vwma(price, lengthL) + multKC * ta.stdev(price, lengthL)
+lowerBB = ta.vwma(price, lengthS) - multKC * ta.stdev(price, lengthS)
+
+range1  = useTrueRange ? ta.tr(true) : (high - low)
+upperKC = ta.vwma(price, lengthKCL) + ta.vwma(range1, lengthKCL) * multKC
+lowerKC = ta.vwma(price, lengthKCS) - ta.vwma(range1, lengthKCS) * multKC
+
+sqzOn = (lowerBB > lowerKC) and (upperBB < upperKC)
+
+valL = ta.linreg(price - math.avg(math.avg(ta.highest(high, lengthKCL), ta.lowest(low, lengthKCL)), ta.vwma(price, lengthKCL)), lengthKCL, 0)
+valS = ta.linreg(price - math.avg(math.avg(ta.highest(high, lengthKCS), ta.lowest(low, lengthKCS)), ta.vwma(price, lengthKCS)), lengthKCS, 0)
+
+sqzUp   = sqzOn and (valL > longVal)
+sqzDown = sqzOn and (valS < shortVal)
+
+// Entry bands
+BBbasisL = ta.vwma(price, BBlengthL)
+BBlower  = BBbasisL - BBmultL * ta.stdev(price, BBlengthL)
+BBupper  = ta.vwma(price, BBlengthS) + BBmultS * ta.stdev(price, BBlengthS)
+
+// The four entry crossovers -- hoisted out of the `if` conditions for v6.
+buyEntry   = ta.crossover(price,  BBlower)
+sellEntry  = ta.crossunder(price, BBupper)
+rsiCrossUp = ta.crossover(vrsiL,  RSIoverSold)
+rsiCrossDn = ta.crossunder(vrsiS, RSIoverBought)
+
+// Capture the entry-bar close when the position opens and hold it. Replaces
+// close[since_entry_long], a DYNAMIC history offset -- Pine's default
+// max_bars_back buffer is 300 bars, Pine sizes it from the loaded history, and
+// results then depend on how much chart history is loaded. Harmless at 4H
+// (holds average ~59 bars) but latent, and fatal on lower timeframes.
+bought = strategy.position_size > strategy.position_size[1]
+sold   = strategy.position_size < strategy.position_size[1]
+
+var float entryCloseL = 0.0
+var float entryCloseS = 0.0
+if bought
+    entryCloseL := close
+if sold
+    entryCloseS := close
+
+stop_loss_amountL = close * SL_percent_basedL / 100
+stop_loss_amountS = close * SL_percent_basedS / 100
+
+// Evaluated once instead of 20 times. Equal to initialEntryPrice while a
+// position is open (pyramiding is 1), na when flat.
+// Guarded: hoisting these to global scope means they also evaluate on flat
+// bars, where strategy.opentrades is 0 and entry_price(opentrades - 1) indexes
+// -1 on an empty trade list. In the original they only ran inside the
+// position blocks, where the index was always valid.
+initialEntryPrice = strategy.opentrades > 0 ? strategy.opentrades.entry_price(0) : na
+lastEntry         = strategy.opentrades > 0 ? strategy.opentrades.entry_price(strategy.opentrades - 1) : na
+
+// =============================================================================
+// TRAILING STOP / TARGET
+// =============================================================================
+price_stop_long    = 0.0
+price_stop_short   = 10000000.0
+targetvalue_long_1 = 0.0
+targetvalue_short_1 = 0.0
+stopvalue_long     = 0.0
+stopvalue_short    = 0.0
+stopvalue_long_1   = seedStopLong
+stopvalue_short_1  = seedStopShort
+profitLockinUp     = initialEntryPrice
+profitLockinDown   = initialEntryPrice
+
+if (strategy.position_size > 0)
+    stopvalue_long     := close - stop_loss_amountL
+    targetvalue_long_1 := entryCloseL + entryCloseL * (L_percent_basedL / 100) * r_ratioL
+    profitLockinUp     := ((targetvalue_long_1 - initialEntryPrice) / profitLineUp) + initialEntryPrice
+
+    if ta.crossover(close, targetvalue_long_1)
+        stopvalue_long := targetvalue_long_1 * flexUp
+    if close > targetvalue_long_1
+        stopvalue_long_1 := price_stop_long + ((close - price_stop_long) * gapUp)
+    if close > profitLockinUp
+        stopvalue_long_1 := price_stop_long + ((close - price_stop_long) * (gapUp - TraceLineUp))
+
+    // Profit ladder -- rungs stay unrolled on purpose (see foot of file)
+    if ta.crossover(close, lastEntry + markUp)
+        stopvalue_long_1 := lastEntry + lockProfitUp
+    if ta.crossover(close, lastEntry + markUp + rangeL)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL
+    if ta.crossover(close, lastEntry + markUp + rangeL * 2)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL * 2
+    if ta.crossover(close, lastEntry + markUp + rangeL * 3)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL * 3
+    if ta.crossover(close, lastEntry + markUp + rangeL * 4)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL * 4
+
+    if close < profitLockinUp
+        profitLockinUp := 0
+    price_stop_long := math.max(stopvalue_long, price_stop_long[1], stopvalue_long_1, profitLockinUp)
+else
+    price_stop_long := 0.0
+
+if (strategy.position_size < 0)
+    stopvalue_short     := close + stop_loss_amountS
+    targetvalue_short_1 := entryCloseS - entryCloseS * (L_percent_basedS / 100) * r_ratioS
+    profitLockinDown    := initialEntryPrice - ((initialEntryPrice - targetvalue_short_1) / profitLineDown)
+
+    if ta.crossunder(close, targetvalue_short_1)
+        stopvalue_short := targetvalue_short_1 + ((1 - flexDown) * targetvalue_short_1)
+    if close < targetvalue_short_1
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close) * gapDown)
+    if close < profitLockinDown
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close) * (gapDown - TraceLineDown))
+
+    if ta.crossunder(close, lastEntry - markDown)
+        stopvalue_short_1 := lastEntry - lockProfitDown
+    if ta.crossunder(close, lastEntry - markDown - rangeS)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS
+    if ta.crossunder(close, lastEntry - markDown - rangeS * 2)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS * 2
+    if ta.crossunder(close, lastEntry - markDown - rangeS * 3)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS * 3
+    if ta.crossunder(close, lastEntry - markDown - rangeS * 4)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS * 4
+
+    if close > profitLockinDown
+        profitLockinDown := 100000000
+    price_stop_short := math.min(stopvalue_short, price_stop_short[1], stopvalue_short_1, profitLockinDown)
+else
+    price_stop_short := 10000000.0
+
+// =============================================================================
+// ORDERS
+// =============================================================================
+longSignal  = rsiCrossUp and buyEntry  and sqzUp   and (LSMAS > LSMAL) and trend_is_active
+shortSignal = rsiCrossDn and sellEntry and sqzDown and (SSMAS < SSMAL) and trend_is_activeS
+
+if longSignal
+    strategy.entry("long", strategy.long, qty=positionSize)
+else
+    strategy.cancel("long")
+
+if shortSignal
+    strategy.entry("short", strategy.short, qty=positionSize)
+else
+    strategy.cancel("short")
+
+// v6 removed the `when` parameter from every strategy.*() function. It was
+// exact sugar for wrapping the call in an `if`, so this is equivalent.
+// The +/- 10000 offsets park the limit far from market: these are stop-only
+// exits in practice. Preserved from the original.
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+if inLong
+    strategy.exit("long exit", from_entry="long", limit=targetvalue_long_1 + 10000, stop=price_stop_long)
+
+if inShort
+    strategy.exit("short exit", from_entry="short", limit=targetvalue_short_1 - 10000, stop=price_stop_short)
+
+// =============================================================================
+// PLOTS -- every title is now unique so CSV exports do not collide
+// =============================================================================
+plot(BBbasisL, "BB Basis")
+p2 = plot(BBlower, "BB Lower")
+p1 = plot(BBupper, "BB Upper")
+fill(p1, p2)
+
+LADDER = color.rgb(175, 76, 157)
+
+plot(price_stop_long  > 0 ? price_stop_long : na,              "SL Long",      color.red,  style=plot.style_linebr)
+plot(price_stop_long  > 0 ? targetvalue_long_1 : na,           "Target Long",  color.aqua, style=plot.style_linebr)
+plot(price_stop_short < 10000000.0 ? price_stop_short : na,    "SL Short",     color.red,  style=plot.style_linebr)
+plot(price_stop_short < 10000000.0 ? targetvalue_short_1 : na, "Target Short", color.aqua, style=plot.style_linebr)
+
+plot(inLong  ? profitLockinUp   : na, "Lockin Long",  color.green, style=plot.style_linebr)
+plot(inShort ? profitLockinDown : na, "Lockin Short", color.green, style=plot.style_linebr)
+
+plot(inLong  ? lastEntry + markUp                : na, "Ladder L0", LADDER, style=plot.style_linebr)
+plot(inLong  ? lastEntry + markUp + rangeL       : na, "Ladder L1", LADDER, style=plot.style_linebr)
+plot(inLong  ? lastEntry + markUp + rangeL * 2   : na, "Ladder L2", LADDER, style=plot.style_linebr)
+plot(inLong  ? lastEntry + markUp + rangeL * 3   : na, "Ladder L3", LADDER, style=plot.style_linebr)
+plot(inLong  ? lastEntry + markUp + rangeL * 4   : na, "Ladder L4", LADDER, style=plot.style_linebr)
+plot(inShort ? lastEntry - markDown              : na, "Ladder S0", LADDER, style=plot.style_linebr)
+plot(inShort ? lastEntry - markDown - rangeS     : na, "Ladder S1", LADDER, style=plot.style_linebr)
+plot(inShort ? lastEntry - markDown - rangeS * 2 : na, "Ladder S2", LADDER, style=plot.style_linebr)
+plot(inShort ? lastEntry - markDown - rangeS * 3 : na, "Ladder S3", LADDER, style=plot.style_linebr)
+plot(inShort ? lastEntry - markDown - rangeS * 4 : na, "Ladder S4", LADDER, style=plot.style_linebr)
+
+// Position state for CSV export. v6 removed implicit int->bool casting, so the
+// arguments are given explicitly; char="" draws nothing but still exports.
+plotchar(strategy.opentrades, "opentrades", "", location.top)
+
+// =============================================================================
+// PRESERVED QUIRKS -- read before changing anything
+//
+// 1. LONG STOP ASYMMETRY. The two `gap reducer` lines reference
+//    `price_stop_long` (the CURRENT bar, which was re-initialised to 0.0 a few
+//    lines above and not yet assigned), so they collapse to `close * gapUp` --
+//    a fixed 0.5% trailing stop, not a ratchet from the previous stop. The
+//    short side correctly uses `price_stop_short[1]`. This is almost certainly
+//    a bug; it is left in because fixing it changes results.
+//    Fix would be: price_stop_long[1] + ((close - price_stop_long[1]) * gapUp)
+//
+// 2. LADDER RUNGS STAY UNROLLED. A for-loop would be shorter, but ta.crossover
+//    cannot be called in a loop with a different level per iteration. Rewriting
+//    the rungs as `close > lvl and close[1] <= lvl[1]` WOULD allow a loop -- but
+//    that is not equivalent, because these ta.crossover calls sit inside an
+//    `if` and therefore only update their history while a position is open.
+//
+// 3. TAKE-PROFIT DISABLED. The +/- 10000 on strategy.exit parks the limit far
+//    from market. Tested at 1-10%: every level reduced returns.
+//
+// 4. RSI(1) IS DEGENERATE. ta.rsi(close, 1) is 100 on an up bar and 0 on a down
+//    bar, so `ta.crossover(vrsiL, 49)` just means "previous bar down, this bar
+//    up". LSMAlengthS = 1 likewise makes LSMAS identical to close.
+//
+// 5. DOLLAR-DENOMINATED PARAMETERS. markUp/markDown/rangeL/rangeS are absolute
+//    dollar amounts, so the ladder means something different at gold 1200 than
+//    at gold 3500 and cannot be transferred to another instrument.
+// =============================================================================

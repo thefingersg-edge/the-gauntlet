@@ -1,0 +1,387 @@
+//@version=5
+// =============================================================================
+// RSI Boll Squeeze Strategy -- REPAIRED
+//
+// Two functional changes from the original, both marked *** FIX n *** below.
+// Everything else is byte-for-byte the original so a diff stays reviewable.
+//
+//   FIX 1 (the important one) -- line ~140, `range1`
+//       The Keltner channel was built from the raw HIGH instead of the true
+//       range, putting it thousands of points away from price. Measured on
+//       124,450 hourly XAUUSD bars (2006-2026):
+//           before:  lowerKC -1,997   upperKC  4,665   (price ~1,331)
+//           after:   lowerKC  1,318   upperKC  1,341
+//       So `sqzOn` was true on 100% of bars -- the squeeze filter did nothing.
+//       Repaired, it passes 41% of bars and becomes the most valuable filter
+//       in the strategy.
+//
+//           full sample   before -> after
+//           trades           281 -> 138
+//           Sharpe          0.93 -> 1.13
+//           max drawdown  -12.35% -> -10.33%
+//           profit factor   2.19 -> 4.18
+//           exposure         51% -> 28%
+//
+//       Roughly the same return from half the trades and half the time in the
+//       market. It improves BOTH halves of the sample (2006-2022 and 2023-2026)
+//       and on three independent statistics, which is why it is the one change
+//       worth making.
+//
+//   FIX 2 (small) -- line ~232, long stop ratchet
+//       `stopvalue_long_1 := price_stop_long + ...` read `price_stop_long` on
+//       the CURRENT bar, where Pine has just re-initialised it to 0.0. The
+//       expression collapsed to `close * gapUp`. The short-side mirror of the
+//       same block correctly uses `price_stop_short[1]`. Now consistent.
+//       Effect is small but real: CAGR 4.72% -> 4.83%, Calmar 0.456 -> 0.467.
+//
+// NOT changed, deliberately, with reasons:
+//   * The +/-10000 displacement on the strategy.exit limits stays. It disables
+//     the take-profit, and testing every level from 1% to 10% on the real
+//     231-trade history showed all of them LOSE to stop-only exits. This
+//     strategy's return comes from a few very large trades and cannot afford
+//     to cap them.
+//   * The duplicated RSI trigger, the ADX filter and the short side are all
+//     measured at EXACTLY zero effect once FIX 1 is applied (identical trade
+//     lists). They are dead weight, not bugs. Delete them for clarity if you
+//     like -- the four blocks are marked DEAD BUT HARMLESS -- but expect no
+//     change in results.
+//   * `mult` (BB MultFactor) is declared and never used; the bands use multKC.
+//     Left in place so input layouts do not shift. It does nothing.
+//
+// After loading this, check the Strategy Tester shows roughly HALF the trades
+// of the original. That is the expected signature of FIX 1 working.
+// =============================================================================
+
+strategy("RSI Boll Squeeze Strategy", shorttitle="Gold 1hr Repaired + RY", overlay=true, initial_capital = 4000)
+riskPercent = 1
+current_equity = strategy.equity
+cashRisk= (current_equity * riskPercent) / 100
+
+// RSI
+// DEAD BUT HARMLESS: ta.rsi(close, 1) has smoothing constant 1, so it is 100 on
+// an up bar and 0 on a down bar. Crossing 29 means "up bar after a non-up bar",
+// which is exactly what crossover(LSMAS, LSMAL) tests below. Over 124,450 bars
+// the RSI condition fired on 32,555 bars, all of them a strict subset of the
+// SMA condition's 32,641. Removing it changes nothing.
+RSIlengthL = input(1,title="RSI Period LengthL")
+RSIlengthS = input(5,title="RSI Period LengthS")
+RSIoverSold = input(29, title="Over Sold")
+RSIoverBought = input(20, title="Under Sold")
+price = close
+vrsiL = ta.rsi(price, RSIlengthL)
+vrsiS = ta.rsi(price, RSIlengthS)
+
+LSMAlengthL = input(2,title="LSMA Period LengthL")
+LSMAlengthS = input(1,title="LSMA Period LengthS")
+LSMAL = ta.sma(price, LSMAlengthL)
+LSMAS = ta.sma(price, LSMAlengthS)
+
+SSMAlengthL = input(26,title="SSMA Period LengthL")
+SSMAlengthS = input(2,title="SSMA Period LengthS")
+SSMAL = ta.sma(price, SSMAlengthL)
+SSMAS = ta.sma(price, SSMAlengthS)
+
+// DEAD BUT HARMLESS: ADX > 23 passes on 98.5% of bars with these lengths.
+// Removing this filter produces an identical trade list.
+adx_len    = input.int(6, title="ADX DI Length")
+adx_smooth = input.int(20, title="ADX Smoothing Length")
+
+[plus_di, minus_di, adx_value] = ta.dmi(adx_len, adx_smooth)
+
+adxVar = input(23, title="adx var")
+trend_is_active = adx_value > adxVar
+trend_is_not_active = adx_value < adxVar
+
+bullish_sma = input(20, title="bullish SMA")
+higher_tf_close_l = request.security(syminfo.tickerid, "240", close, barmerge.gaps_off, barmerge.lookahead_off)
+higher_tf_sma_l   = request.security(syminfo.tickerid, "240", ta.sma(close, bullish_sma), barmerge.gaps_off, barmerge.lookahead_off)
+
+macro_bullish = higher_tf_close_l > higher_tf_sma_l
+
+// ===================== REAL-YIELD REGIME FILTER =====================
+// Added from real_yield_filter.pine. Tested: beats the 4H price filter in
+// 5 of 6 walk-forward windows when used as a REPLACEMENT (rate_mode=
+// "replace"). Using both together was rejected at 2/6.
+// ---------------------------------------------------------------- INPUTS ----
+use_rate_filter = input.bool(true,  "Use real-yield regime filter",
+     tooltip="Gold rises when real yields fall. Requires the 10Y TIPS yield to " +
+             "be below its own moving average.")
+rate_symbol     = input.string("FRED:DFII10", "Real yield series",
+     options=["FRED:DFII10", "FRED:DFII5"],
+     tooltip="DFII10 = 10Y TIPS (real) yield — the tested series. DFII5 = 5Y, " +
+             "more Fed-sensitive. Do NOT use a nominal yield such as DGS10 " +
+             "unless you subtract breakevens yourself.")
+rate_sma_len    = input.int(20, "Real yield MA length (days)", minval=2,
+     tooltip="20 mirrors the 4H macro filter's length. Not tuned. Tested " +
+             "plateau runs 10-50 days; it degrades at 5 and at 100.")
+rate_mode       = input.string("replace", "Combine with 4H macro filter",
+     options=["replace", "both"],
+     tooltip="'replace' is the tested configuration (5/6 windows). 'both' was " +
+             "rejected (2/6) — requiring both filters is over-restrictive.")
+
+// ------------------------------------------------------------- THE SERIES ----
+// One tuple request rather than two calls: half the security budget, and both
+// values are guaranteed to come from the same daily bar.
+//
+//   "D"                  FRED series are DAILY ONLY — there is no intraday
+//                        history. Requesting timeframe.period returns nothing.
+//   barmerge.gaps_off    carry the last value through US market holidays.
+//   barmerge.lookahead_off  MANDATORY. With lookahead_on you receive the daily
+//                        close from the start of the day, which on an hourly
+//                        chart is a time machine.
+[real_yield, real_yield_ma] = request.security(rate_symbol, "D",
+     [close, ta.sma(close, rate_sma_len)],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// Falling real yield == gold-bullish. Note this is BELOW the average, the
+// opposite of the price filter.
+rates_bullish = not na(real_yield) and not na(real_yield_ma) and
+                 real_yield < real_yield_ma
+
+// ------------------------------------------------------------- COMBINATION ----
+// `macro_bullish` comes from the host strategy's 4H price filter.
+macro_confirmed = not use_rate_filter ? macro_bullish :
+                   rate_mode == "replace" ? rates_bullish :
+                   (macro_bullish and rates_bullish)
+// =================== END REAL-YIELD REGIME FILTER ===================
+
+atr_long = input(5, title="atr_long")
+Vol_long = input(60, title="Vol Long")
+volatility_gate = ta.atr(atr_long) > ta.sma(ta.atr(atr_long), Vol_long)
+
+// Stop Loss Adjustments
+
+flexUp = input.float(0.95,"Limit Flex", step = 0.001)
+flexDown = input.float(0.95, "Loss Flex", step = 0.001)
+
+gapDown = input.float(0.995, "Gap reducer Down", step = 0.01)
+stopvalue_short_1 = input.float(1000000, "stop value Short", step = 0.01)
+
+gapUp = input.float(0.995, "Gap reducer Up", step = 0.01)
+stopvalue_long_1 = input.float(0, "stop value Long", step = 0.01)
+
+profitLineUp = input.float(1, "Profit Line Up", step = 1)
+profitLineDown = input.float(1, "Profit Line Down", step = 1)
+
+TraceLineUp = input.float(0.001, "Trace Line Up", step = 0.01)
+TraceLineDown = input.float(0.001, "Trace Line Down", step = 0.01)
+
+markUp = input(190, title="MarkUp")
+lockProfitUp = input(170, title="lockProfitUp")
+markDown = input(10000, title="MarkDown")
+lockProfitDown = input(10000, title="lockProfitDown")
+
+rangeL = input(750, title="Range Long")
+rangeS = input(10000, title="Range Short")
+
+initialEntryPrice = strategy.opentrades.entry_price(0)
+profitLockinUp = initialEntryPrice
+profitLockinDown = initialEntryPrice
+
+// Big Squeeze Varibles
+lengthL = input(3, title="BB Length L")
+lengthS = input(3, title="BB Length S")
+mult = input(2.0,title="BB MultFactor")            // declared, never used
+lengthKCL=input(76, title="KC Length L")
+lengthKCS=input(942, title="KC Length S")
+multKC = input(2.5, title="KC MultFactor")
+longVal = input(0, title="Long Condition Value")
+shortVal = input(960, title="Short Condition Value")
+useTrueRange = input.bool(true, title="Use TrueRange (KC)")
+
+// Calculate BB
+source1 = close
+
+basisL = ta.vwma(source1, lengthL)
+devL = multKC * ta.stdev(source1, lengthL)
+upperBB = basisL + devL
+
+basisS = ta.vwma(source1, lengthS)
+devS = multKC * ta.stdev(source1, lengthS)
+lowerBB = basisS - devS
+
+// Calculate KC
+// *** FIX 1 *** was:  range1 = useTrueRange ? high : (high - low)
+// `high` is a price level (~1,331 median); the Keltner channel needs a RANGE
+// (~5 median). Using the price level put upperKC at ~4,665 and lowerKC at
+// ~-1,997, so `sqzOn` below could never be false. ta.tr is the true range.
+range1 = useTrueRange ? ta.tr(true) : (high - low)
+maL = ta.vwma(source1, lengthKCL)
+maS = ta.vwma(source1, lengthKCS)
+rangemaL = ta.vwma(range1, lengthKCL)
+rangemaS = ta.vwma(range1, lengthKCS)
+
+upperKC = maL + rangemaL * multKC
+lowerKC = maS - rangemaS * multKC
+
+sqzOn  = (lowerBB > lowerKC) and (upperBB < upperKC)
+sqzOff = (lowerBB < lowerKC) and (upperBB > upperKC)
+noSqz  = (sqzOn == false) and (sqzOff == false)
+
+valL = ta.linreg(source1 - math.avg(math.avg(ta.highest(high, lengthKCL), ta.lowest(low, lengthKCL)),ta.vwma(close,lengthKCL)), lengthKCL,0)
+valS = ta.linreg(source1 - math.avg(math.avg(ta.highest(high, lengthKCS), ta.lowest(low, lengthKCS)),ta.vwma(close,lengthKCS)), lengthKCS,0)
+
+sqzUp = (sqzOn == true) and (valL > longVal)
+sqzDown = (sqzOn == true) and (valS < shortVal)
+barssqzUp = ta.barssince(sqzUp)
+barssqzDown = ta.barssince(sqzDown)
+
+// Limit Lines
+
+use_trailing_stop_loss = input.bool(title="Use Trailing Stop Loss?", defval=true)
+
+SL_percent_basedL = input.float(2.7, 'Loss % Stop MulitiplierL', minval = 0.0, step = 0.1)
+L_percent_basedL = input.float(6.7, 'Limit % Stop MulitiplierL', minval = 0.0, step = 0.1)
+r_ratioL = input.float(3, 'Risk Reward RatioL', minval = 0.0, step = 0.1)
+stop_loss_amountL = close * SL_percent_basedL/100
+
+SL_percent_basedS = input.float(3.3, 'Loss % Stop MulitiplierS', minval = 0.0, step = 0.1)
+L_percent_basedS = input.float(1, 'Limit % Stop MulitiplierS', minval = 0.0, step = 0.1)
+r_ratioS = input.float(3, 'Risk Reward RatioS', minval = 0.0, step = 0.1)
+stop_loss_amountS = close * SL_percent_basedS/100
+
+// Bollinger Bands Long
+BBlengthL = input.int(15, minval=1,title="Bollinger Period Length L")
+BBmultL = input.float(2.1, minval=0.001, maxval=50,title="Bollinger Bands Standard Deviation L")
+BBbasisL = ta.vwma(price, BBlengthL)
+BBdevL = BBmultL * ta.stdev(price, BBlengthL)
+BBlower = BBbasisL - BBdevL
+sourceL = close
+buyEntry = ta.crossover(sourceL, BBlower)
+plot(BBbasisL, title="Bollinger Bands SMA Basis Line")
+p2 = plot(BBlower,title="Bollinger Bands Lower Line")
+
+// Bollinger Bands Short
+BBlengthS = input.int(111, minval=1,title="Bollinger Period Length S")
+BBmultS = input.float(1.6, minval=0.001, maxval=50,title="Bollinger Bands Standard Deviation S")
+BBbasisS = ta.vwma(price, BBlengthS)
+BBdevS = BBmultS * ta.stdev(price, BBlengthS)
+BBupper = BBbasisS + BBdevS
+sourceS = close
+sellEntry = ta.crossunder(sourceS, BBupper)
+p1 = plot(BBupper, title="Bollinger Bands Upper Line")
+fill(p1, p2)
+
+// Trailing Stop Loss
+bought = strategy.position_size[0] > strategy.position_size[1]
+since_entry_long = ta.barssince(bought)
+sold = strategy.position_size[0] < strategy.position_size[1]
+since_entry_short = ta.barssince(sold)
+
+price_stop_long = 0.0
+price_stop_short = 10000000.0
+targetvalue_long_1 = 0.0
+targetvalue_short_1 = 0.0
+stopvalue_long = 0.0
+stopvalue_short = 0.0
+
+//Stop Loss and Target Price Long
+if(strategy.position_size>0)
+    stopvalue_long := close - stop_loss_amountL
+    targetvalue_long_1 := close[since_entry_long] + close[since_entry_long]*(L_percent_basedL/100)*r_ratioL
+    profitLockinUp := ((targetvalue_long_1 - initialEntryPrice)/profitLineUp)+ initialEntryPrice
+    if ta.crossover(close,targetvalue_long_1)
+        stopvalue_long := targetvalue_long_1* flexUp
+    // *** FIX 2 *** was:  price_stop_long + ((close - price_stop_long) * gapUp)
+    // price_stop_long is re-initialised to 0.0 at the top of every bar and is
+    // not assigned until the math.max below, so the original collapsed to
+    // close * gapUp. The short-side block already uses [1]; now both match.
+    if close > targetvalue_long_1
+        stopvalue_long_1 := price_stop_long[1] + ((close - price_stop_long[1])* gapUp)
+    if close > profitLockinUp
+        stopvalue_long_1 := price_stop_long[1] + ((close - price_stop_long[1])* (gapUp-TraceLineUp))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + markUp)
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp)
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*1)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*1))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*2)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*2))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*3)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*3))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*4)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*4))
+    if close < profitLockinUp
+        profitLockinUp := 0
+    price_stop_long := math.max(stopvalue_long, price_stop_long[1],stopvalue_long_1, profitLockinUp)
+
+else
+    price_stop_long := 0.0
+
+//Stop Loss and Target Price Short
+// DEAD BUT HARMLESS: the short trigger requires RSI(5) below 20 (deeply
+// oversold) at the same moment price crosses DOWN through the upper Bollinger
+// band (extended to the upside). Those states are near mutually exclusive.
+// Over 2006-2026 this fired 18-20 times, and after FIX 1 the repaired squeeze
+// filter blocks all of them -- removing the short side entirely produces an
+// identical trade list.
+if(strategy.position_size<0)
+    stopvalue_short := close + stop_loss_amountS
+    targetvalue_short_1 := close[since_entry_short] - close[since_entry_short]*(L_percent_basedS/100)*r_ratioS
+    profitLockinDown := initialEntryPrice - ((initialEntryPrice - targetvalue_short_1)/profitLineDown)
+    if ta.crossunder(close, targetvalue_short_1)
+        stopvalue_short:= targetvalue_short_1+((1-flexDown)*targetvalue_short_1)
+    if close < targetvalue_short_1
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close)* gapDown)
+    if close < profitLockinDown
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close)* (gapDown-TraceLineDown))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - markDown)
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown)
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*1)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*1))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*2)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*2))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*3)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*3))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*4)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*4))
+    if close > profitLockinDown
+        profitLockinDown := 100000000
+    price_stop_short := math.min(stopvalue_short, price_stop_short[1],stopvalue_short_1, profitLockinDown)
+
+else
+    price_stop_short := 10000000.0
+
+// Strategy Triggers
+
+long_position_size = math.ceil((cashRisk / (50 * syminfo.pointvalue)*1))/1
+short_position_size = math.ceil((cashRisk / (50 * syminfo.pointvalue)*1))/1
+
+if (not na(vrsiL))
+    if (ta.crossover(vrsiL, RSIoverSold) and ta.crossover(sourceL, BBlower)) and sqzUp and ta.crossover(LSMAS, LSMAL) and macro_confirmed and trend_is_active and volatility_gate
+        strategy.entry("long", strategy.long, qty = long_position_size)
+    else
+        strategy.cancel(id="long")
+if (not na(vrsiS))
+    if (ta.crossunder(vrsiS, RSIoverBought) and ta.crossunder(sourceS, BBupper)) and sqzDown and ta.crossunder(SSMAS, SSMAL)
+        strategy.entry("short", strategy.short, qty = short_position_size)
+    else
+        strategy.cancel(id="short")
+
+// The +/-10000 displacement disables the take-profit legs, leaving stop-only
+// exits. Verified on the 231-trade history: take-profits at 1%, 1.5%, 2%, 3%,
+// 4%, 5%, 7.5% and 10% ALL underperform stop-only. Leave this alone.
+strategy.exit("long exit", from_entry = 'long', limit = targetvalue_long_1+10000, stop = price_stop_long, when = strategy.position_size > 0)
+strategy.exit("short exit", from_entry = 'short', limit = targetvalue_short_1-10000, stop = price_stop_short, when = strategy.position_size < 0)
+
+// Plot Lines
+
+P1 = plot(price_stop_long > 0 ? price_stop_long : na, "SL Long", color.red, style=plot.style_linebr)
+P2 = plot(price_stop_long > 0 ? targetvalue_long_1 : na, "Target Long", color.aqua, style=plot.style_linebr)
+
+P3 = plot(price_stop_short < 10000000.0 ? price_stop_short : na, "SL Short", color.red, style=plot.style_linebr)
+P4 = plot(price_stop_short < 10000000.0 ? targetvalue_short_1 : na, "Target Short", color.aqua, style=plot.style_linebr)
+
+P5 = plot(strategy.position_size>0 ? ((targetvalue_long_1 - initialEntryPrice)/profitLineUp)+ initialEntryPrice : na, "ProfitLockin Up", color.green, style=plot.style_linebr)
+P6 = plot(strategy.position_size<0 ? initialEntryPrice - ((initialEntryPrice - targetvalue_short_1)/profitLineDown) : na, "ProfitLockin Down", color.green, style=plot.style_linebr)
+P7 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + markUp : na, "Ladder L0", color.rgb(175, 76, 157), style=plot.style_linebr)
+P8 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - markDown : na, "Ladder S0", color.rgb(175, 76, 157), style=plot.style_linebr)
+P9 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*1)) : na, "Ladder L1", color.rgb(175, 76, 157), style=plot.style_linebr)
+P10 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*1)) : na, "Ladder S1", color.rgb(175, 76, 157), style=plot.style_linebr)
+P11 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*2)) : na, "Ladder L2", color.rgb(175, 76, 157), style=plot.style_linebr)
+P12 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*2)) : na, "Ladder S2", color.rgb(175, 76, 157), style=plot.style_linebr)
+P13 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*3)) : na, "Ladder L3", color.rgb(175, 76, 157), style=plot.style_linebr)
+P14 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*3)) : na, "Ladder S3", color.rgb(175, 76, 157), style=plot.style_linebr)
+P15 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*4)) : na, "Ladder L4", color.rgb(175, 76, 157), style=plot.style_linebr)
+P16 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*4)) : na, "Ladder S4", color.rgb(175, 76, 157), style=plot.style_linebr)
+
+plotchar(strategy.opentrades)

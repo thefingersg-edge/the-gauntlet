@@ -1,0 +1,80 @@
+//@version=6
+indicator("MACD Fake Filter — fixed (scaled, rolling)", shorttitle = "MACD FF fixed", max_labels_count = 500)
+
+// =====================================================================
+// A corrected version of "MACD Fake Filter [RH]" (HasanRifat, MPL-2.0).
+// Same idea: only show a MACD/signal cross when MACD is more stretched
+// than its usual wave, i.e. an exhaustion / snap-back signal.
+// Two fixes:
+//  1. MACD is divided by ATR, so wave heights compare like with like
+//     across years and price levels (raw points grow with the price).
+//  2. The average wave height uses the last N COMPLETED waves (one value
+//     per wave), not an expanding average that depends on how much
+//     history the chart loads, and no per-bar placeholder values.
+// A visualisation, not a tested signal. Not financial advice.
+// =====================================================================
+
+fastLength   = input.int(12, "Fast length")
+slowLength   = input.int(26, "Slow length")
+signalLength = input.int(9,  "Signal smoothing", minval = 1, maxval = 50)
+src          = input.source(close, "Source")
+atrLen       = input.int(100, "ATR length for scaling", minval = 10)
+nWaves       = input.int(50, "Waves in the average", minval = 5, maxval = 500)
+mult         = input.float(1.0, "Threshold x average wave", minval = 0.1, step = 0.1)
+
+atr    = ta.atr(atrLen)
+macd   = (ta.ema(src, fastLength) - ta.ema(src, slowLength)) / atr
+signal = ta.ema(macd, signalLength)
+hist   = macd - signal
+
+var array<float> peaks   = array.new_float()
+var array<float> troughs = array.new_float()
+var float wavePeak   = na
+var float waveTrough = na
+var int   wave       = 0            // +1 above zero, -1 below
+
+// close the finished wave and store its extreme once
+if not na(macd) and not na(macd[1])
+    if macd > 0 and macd[1] <= 0
+        if wave == -1 and not na(waveTrough)
+            array.push(troughs, waveTrough)
+            if array.size(troughs) > nWaves
+                array.shift(troughs)
+        wave := 1
+        wavePeak := macd
+    else if macd < 0 and macd[1] >= 0
+        if wave == 1 and not na(wavePeak)
+            array.push(peaks, wavePeak)
+            if array.size(peaks) > nWaves
+                array.shift(peaks)
+        wave := -1
+        waveTrough := macd
+    else if wave == 1
+        wavePeak := math.max(wavePeak, macd)
+    else if wave == -1
+        waveTrough := math.min(waveTrough, macd)
+
+ready   = array.size(peaks) >= 10 and array.size(troughs) >= 10
+avgPeak = ready ? array.avg(peaks) * mult : na
+avgTrgh = ready ? array.avg(troughs) * mult : na
+
+bearCross = ta.crossunder(macd, signal) and ready and macd > avgPeak
+bullCross = ta.crossover(macd, signal)  and ready and macd < avgTrgh
+
+if bearCross and barstate.isconfirmed
+    label.new(bar_index, macd, "", color = color.red, style = label.style_label_down, size = size.tiny)
+if bullCross and barstate.isconfirmed
+    label.new(bar_index, macd, "", color = color.green, style = label.style_label_up, size = size.tiny)
+
+hline(0, "Zero", color = color.new(#5171e6, 50))
+plot(hist, "Histogram", style = plot.style_histogram,
+     color = hist >= 0 ? (hist > hist[1] ? #32cd32 : #008000) : (hist > hist[1] ? #800000 : #ff0000))
+pM = plot(macd,   "MACD / ATR", color = #2962FF, linewidth = 2)
+plot(signal, "Signal", color = #FF6D00)
+pP = plot(avgPeak, "Average peak (last N waves)",   color = color.green)
+pT = plot(avgTrgh, "Average trough (last N waves)", color = color.red)
+fill(pM, pP, color = macd > avgPeak ? color.new(color.green, 75) : na, title = "Stretched up")
+fill(pM, pT, color = macd < avgTrgh ? color.new(color.red, 75)   : na, title = "Stretched down")
+
+alertcondition(bearCross, "Bearish cross above average peak",  "MACD FF: bearish exhaustion cross")
+alertcondition(bullCross, "Bullish cross below average trough", "MACD FF: bullish exhaustion cross")

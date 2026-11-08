@@ -1,0 +1,168 @@
+//@version=6
+// =============================================================================
+// silver15 v3 — slow directional momentum
+//
+//   *** THIS STRATEGY WAS TESTED AND REJECTED. DO NOT TRADE IT. ***
+//
+//   Pooled across 28 instruments, 2006-2026, H4, measured spreads:
+//       13,013 trades   mean P&L -0.0791 vol units
+//       bootstrap 95% CI [-0.1849, +0.0216]   implied annual Sharpe -0.35
+//       real 33.86% vs random 33.34% -> +1.49 sd, inside noise
+//
+//   It is here so the logic can be inspected on a chart, and so Pine and
+//   Python can be checked against each other. A single instrument will look
+//   better or worse than the pooled result by chance; that is exactly the
+//   selection effect the pooled test exists to avoid. Judging this script by
+//   how it looks on one symbol is the mistake, not the point.
+//
+//   Spec frozen in PREREGISTRATION_v3.md. Engine verified by audit.py
+//   (8 synthetic controls, including a look-ahead probe).
+//
+// -----------------------------------------------------------------------------
+// TWO PARITY TRAPS, BOTH HANDLED BELOW — read before changing anything
+//
+// 1. STANDARD DEVIATION CONVENTION.
+//      pandas  .rolling(n).std()  uses ddof=1  (SAMPLE)
+//      Pine    ta.stdev(x, n)     uses ddof=0  (POPULATION)
+//    They differ by sqrt(n/(n-1)). At n=14 that is 3.8% — enough to move every
+//    barrier and shift which trades stop out. Corrected by ddofAdj() below.
+//    This is the single most likely cause of a Pine/Python mismatch here.
+//
+// 2. INTRABAR vs CLOSE-TO-CLOSE EXITS.
+//    The Python checks barriers on BAR CLOSES only, because for the pair
+//    version the spread's intrabar path is not observable. strategy.exit()
+//    with stop/limit fires INTRABAR, which is more realistic but does NOT
+//    match the Python. `useIntrabarExits` defaults to false for parity.
+//    Turn it on to see the realistic version — and expect different numbers.
+// =============================================================================
+
+strategy("silver15 v3 — slow momentum (REJECTED)",
+     overlay              = true,
+     initial_capital      = 100000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 100,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.00335,   // PER SIDE. SPX500 measured round trip
+                                       // is 0.0067% of price -> half each way.
+                                       // CHANGE THIS PER SYMBOL (see table).
+     process_orders_on_close = true,   // Python enters at the signal bar close
+     calc_on_every_tick   = false,
+     pyramiding           = 0)
+
+// ---- FROZEN PARAMETERS (PREREGISTRATION_v3.md) ------------------------------
+LOOKBACK   = input.int(60,   "Momentum lookback (bars)", minval=2)
+ENTRY_Z    = input.float(1.0, "Entry |z|", step=0.1)
+HOLD       = input.int(60,   "Max hold / re-entry lockout (bars)", minval=1)
+VOL_WINDOW = input.int(14,   "Volatility window (bars)", minval=2)
+SL_VOL     = input.float(2.90, "Stop, in vol units", step=0.01)
+TP_VOL     = input.float(8.71, "Target, in vol units", step=0.01)
+useIntrabarExits = input.bool(false, "Intrabar exits (breaks Python parity)")
+
+// Measured round-trip spreads, % of price. HALVE for commission_value.
+//   SPX500 0.0067   US30 0.0067   NAS100 0.0095   DAX 0.0120   USDCAD 0.0128
+//   US2000 0.0135   EURUSD 0.0140  GBPUSD 0.0142  EURJPY 0.0146  GBPJPY 0.0153
+//   FR40 0.0167     EURGBP 0.0163  EURCHF 0.0173  SMI 0.0176   AUDUSD 0.0186
+//   USDCHF 0.0186   UK100 0.0171   AUDNZD 0.0215  EURAUD 0.0220  EU50 0.0223
+//   HK33 0.0243     NZDUSD 0.0259  AEX 0.0277    JP225 0.0327  NZDCAD 0.0331
+//   AU200 0.0363    Brent 0.0467   WTI 0.0501    gold 0.0151   silver 0.0600
+
+// ---- SIGNAL -----------------------------------------------------------------
+// pandas uses the SAMPLE standard deviation; Pine uses POPULATION. Convert.
+ddofAdj(int n) => math.sqrt(n / (n - 1.0))
+
+logc   = math.log(close)
+sdLog  = ta.stdev(logc, LOOKBACK) * ddofAdj(LOOKBACK)
+z      = sdLog > 0 ? (logc - ta.sma(logc, LOOKBACK)) / sdLog : na
+
+logret = logc - logc[1]
+vol    = ta.stdev(logret, VOL_WINDOW) * ddofAdj(VOL_WINDOW)
+
+// TREND direction: follow the move. Fading it is the reversed variant, which
+// the null test showed is worse — but not decisively (32.84% vs 33.86%).
+longSig  = not na(z) and z >=  ENTRY_Z
+shortSig = not na(z) and z <= -ENTRY_Z
+
+// ---- NON-OVERLAP ------------------------------------------------------------
+// The Python allows one entry per HOLD bars measured from the previous ENTRY,
+// not from the previous exit. A trade stopped out at bar 5 still blocks new
+// entries until bar 60. Without this the trade count roughly triples and every
+// significance figure computed on it is inflated.
+var int lastEntryBar = -100000
+canEnter = (bar_index - lastEntryBar) >= HOLD and strategy.position_size == 0
+
+var float entryVol   = na
+var int   entryBar   = na
+var float entryPrice = na
+
+if canEnter and barstate.isconfirmed
+    if longSig
+        strategy.entry("L", strategy.long)
+        entryVol   := vol
+        entryBar   := bar_index
+        entryPrice := close
+        lastEntryBar := bar_index
+    else if shortSig
+        strategy.entry("S", strategy.short)
+        entryVol   := vol
+        entryBar   := bar_index
+        entryPrice := close
+        lastEntryBar := bar_index
+
+// ---- EXITS ------------------------------------------------------------------
+// Barriers are in LOG-RETURN space in the Python, so convert to price levels
+// with exp(). Using entry_price * (1 +/- k*vol) instead is a linear
+// approximation that drifts at the 8.71-vol target — about 0.5% at typical
+// index vol, which is larger than the entire measured edge.
+inPos   = strategy.position_size != 0
+isLong  = strategy.position_size > 0
+barsIn  = inPos and not na(entryBar) ? bar_index - entryBar : 0
+
+tpPrice = na(entryPrice) or na(entryVol) ? na :
+     isLong ? entryPrice * math.exp( TP_VOL * entryVol)
+            : entryPrice * math.exp(-TP_VOL * entryVol)
+slPrice = na(entryPrice) or na(entryVol) ? na :
+     isLong ? entryPrice * math.exp(-SL_VOL * entryVol)
+            : entryPrice * math.exp( SL_VOL * entryVol)
+
+if inPos
+    if useIntrabarExits
+        // Realistic, but NOT what the Python measured.
+        strategy.exit("x", limit=tpPrice, stop=slPrice)
+    else
+        // Parity mode: evaluate on the close, exactly as the Python does.
+        hitTp = isLong ? close >= tpPrice : close <= tpPrice
+        hitSl = isLong ? close <= slPrice : close >= slPrice
+        if hitSl
+            strategy.close_all(comment="sl")
+        else if hitTp
+            strategy.close_all(comment="tp")
+    if barsIn >= HOLD
+        strategy.close_all(comment="time")
+
+// ---- PLOTS ------------------------------------------------------------------
+plot(inPos ? tpPrice : na, "TP", color.new(color.teal,   0), style=plot.style_linebr)
+plot(inPos ? slPrice : na, "SL", color.new(color.maroon, 0), style=plot.style_linebr)
+plot(ta.sma(logc, LOOKBACK) > 0 ? math.exp(ta.sma(logc, LOOKBACK)) : na,
+     "Anchor MA", color.new(color.gray, 40))
+
+hline(0, "", color.new(color.gray, 70))
+plotchar(z, "z", "", location.top, color.new(color.gray, 100))
+
+bgcolor(longSig  ? color.new(color.teal,   94) :
+        shortSig ? color.new(color.maroon, 94) : na)
+
+// =============================================================================
+// HOW TO CHECK PARITY WITH THE PYTHON
+//
+// 1. Set commission_value to HALF the round-trip spread for your symbol.
+// 2. Leave useIntrabarExits OFF.
+// 3. Use the 4-hour chart with the OANDA feed — that is what was tested, and
+//    the data was verified at 100% exact OHLC parity with a TradingView export.
+// 4. Compare the trade LIST, not the equity curve: entry timestamps should
+//    match prereg_v3_test.py exactly. If entries match but exits do not, the
+//    cause is almost always the ddof convention above.
+//
+// EXPECT A DIFFERENT RESULT FROM THE POOLED TEST. One symbol out of 28 will
+// land anywhere in a wide distribution. If it looks good on your chart, that
+// is one draw from a null, not a discovery.
+// =============================================================================

@@ -1,0 +1,42 @@
+
+=== ARM G (trend-aligned shock reversal) — cleared 3 of 7 ===
+    trades 1589  markets 21
+  [FAIL] 1 SIGN CONSISTENCY
+          by_era: {'E1': 0.00011, 'E2': -0.00329, 'E3': -0.00125}
+          n_by_era: {'E1': 469, 'E2': 535, 'E3': 573}
+  [FAIL] 2 BREADTH
+          positive: 7
+          traded: 21
+          universe: 21
+          per_market: {'audusd': 0.00034, 'bcousd': 0.0016, 'cornusd': -0.00198, 'de10ybeur': -0.00152, 'de30eur': 0.00071, 'eurgbp': -0.0008, 'eurjpy': 0.0008, 'eurusd': -0.00027, 'gbpusd': -0.0004, 'nas100usd': -0.00172, 'natgasusd': -0.00932, 'spx500usd': 0.00423, 'sugarusd': -0.00442, 'usb10yusd': -0.00072, 'usdcad': -0.0015, 'usdjpy': 0.00075, 'wheatusd': -0.00883, 'xagusd': -0.00462, 'xauusd': -0.00029, 'xcuusd': 0.00099, 'xptusd': -0.0044}
+  [FAIL] 3 EFFECT SIZE
+          mean_net_per_trade: -0.00156
+          mean_gross_per_trade: -1e-05
+          mean_cost_per_trade: 0.00155
+          threshold: 0.002
+  [PASS] 4 SAMPLE
+          n: 1589
+          threshold: 200
+  [FAIL] 5 ROBUSTNESS
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: -0.00156
+          note: not applicable: base edge is not positive
+  [PASS] 6 MATCHED CONTROL
+          edge_vs_control: 0.00123
+          n_matched: 1546
+          coverage: 97% of 1589 trades
+  [PASS] 7 DAILY RISK
+          measured_daily_max_dd: -24.5%
+          claimed_by_strategy: -20.0%
+          resolution: daily close, open positions marked
+          tolerance: claim may understate by at most 25%
+
+    equity 10,000 -> 8,318   CAGR -0.9%   daily max DD -24.5%
+
+  --- ARM G's own kill conditions ---
+  K2 is it ARM F relabelled: ex-index pooled net -0.2078% (abandon if < +0.10%), 5 of 18 positive (abandon if < 11)
+  K3 short side E1: +0.1024%  n=166
+  K3 short side E2: -0.3925%  n=263
+  K3 short side E3: -0.2933%  n=239
+  K4 decay: E1 +0.0105%  E3 -0.1252%  (abandon if E3 < E1/3)
+  K5 ex-crisis: -0.1438% on 1486 trades (abandon if negative)

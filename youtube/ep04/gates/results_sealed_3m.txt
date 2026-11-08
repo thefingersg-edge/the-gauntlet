@@ -1,0 +1,13 @@
+ARM F part A — dip-buy, the only arm whose markets are all extended
+
+  backtest  2005-01 .. 2026-08-07     696 trades   net/trade +0.5133%   win 75%   best +8.72%  worst -7.44%
+  SEALED    2026-08-08 .. 2026-11-05   15 trades   net/trade +0.0802%   win 80%   best +1.85%  worst -5.71%
+
+    sealed: spx500usd                   6 trades   net/trade +1.0085%   win 100%   best +1.85%  worst +0.15%
+    sealed: nas100usd                   5 trades   net/trade -1.3932%   win 60%   best +1.53%  worst -5.71%
+    sealed: de30eur                     4 trades   net/trade +0.5295%   win 75%   best +1.76%  worst -1.40%
+
+  sealed-segment gross +0.1541%   cost 0.0739%
+  compounded on notional over the segment: +0.83%
+
+  backtest mean was +0.513%/trade. Sealed segment is 16% of that.

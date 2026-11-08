@@ -1,0 +1,46 @@
+
+=== ARM F part A (dip-buy), 2% risk — cleared 5 of 7 ===
+    trades 711  markets 3
+  [PASS] 1 SIGN CONSISTENCY
+          by_era: {'E1': 0.00575, 'E2': 0.00518, 'E3': 0.00459}
+          n_by_era: {'E1': 196, 'E2': 258, 'E3': 244}
+  [FAIL] 2 BREADTH
+          positive: 3
+          traded: 3
+          universe: 21
+          per_market: {'de30eur': 0.00537, 'nas100usd': 0.00495, 'spx500usd': 0.00484}
+  [PASS] 3 EFFECT SIZE
+          mean_net_per_trade: 0.00504
+          mean_gross_per_trade: 0.00581
+          mean_cost_per_trade: 0.00077
+          threshold: 0.002
+  [PASS] 4 SAMPLE
+          n: 711
+          threshold: 200
+  [FAIL] 5 ROBUSTNESS
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: 0.00504
+          worst: rsi_exit=52 -> 0.00369 (73% of base)
+          all: [('sma_trend', 150, 0.00449, 0.891), ('sma_trend', 250, 0.0046, 0.912), ('rsi_entry', 15, 0.00493, 0.978), ('rsi_entry', 25, 0.00396, 0.786), ('rsi_exit', 52, 0.00369, 0.732), ('rsi_exit', 88, 0.00502, 0.996), ('limit_atr', 0.1875, 0.00478, 0.949), ('limit_atr', 0.3125, 0.00539, 1.07), ('atr_n', 15, 0.0053, 1.051), ('atr_n', 25, 0.00533, 1.057), ('stop_atr', 2.25, 0.00453, 0.898), ('stop_atr', 3.75, 0.00516, 1.023), ('time_limit', 8, 0.0049, 0.972), ('time_limit', 12, 0.0051, 1.012)]
+  [PASS] 6 MATCHED CONTROL
+          edge_vs_control: 0.00423
+          n_matched: 697
+          coverage: 98% of 711 trades
+  [PASS] 7 DAILY RISK
+          measured_daily_max_dd: -10.2%
+          claimed_by_strategy: no claim made
+          resolution: daily close, open positions marked
+          note: nothing was concealed because nothing was claimed
+
+    equity: 10,000 -> 54,787  CAGR 8.4%  daily max DD -10.2%
+
+    ENGINE VALIDATION vs its own published figures, 4% risk:
+      trades   ours 696      its 697   (spx 238 vs 237)
+      IS/yr    ours 21.8%    its 20.1%
+      IS DD    ours 19.8%    its 20.9%
+      OOS/yr   ours  9.5%    its  9.8%
+      OOS DD   ours 18.9%    its 20.2%
+      end      ours 248,203  its ~251,700
+
+    gate 7 is PROVISIONAL: part B (overnight sleeve) needs hourly bars
+    and will add to the drawdown before the arm is finally scored.

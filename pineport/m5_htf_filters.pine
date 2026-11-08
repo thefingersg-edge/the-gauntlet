@@ -1,0 +1,105 @@
+// =============================================================================
+// M5 SHORT-SIDE FILTERS VIA request.security -- drop-in replacement block
+//
+// The M5 training returned two short-side lookbacks past Pine's 5000-bar
+// max_bars_back ceiling:
+//
+//     atr_longS                    9,093 M5 bars = 31.6 days
+//     adx_lenS + adx_smoothS       2,557 + 4,308 = 6,865 bars = 24 days
+//
+// ta.dmi(len, smooth) needs len + smooth bars of history, which is why the
+// ADX pair breaks the limit even though neither number alone does.
+//
+// Both are computed on H1 instead, at the SAME TIME HORIZON: an M5 bar count
+// converts as  bars x 5 / 60.
+//
+//     atr_longS      9,093 -> 758 H1 bars
+//     Vol_longS      1,109 ->  92 H1 bars
+//     adx_lenS       2,557 -> 213 H1 bars
+//     adx_smoothS    4,308 -> 359 H1 bars
+//
+// THE COMPANION PARAMETERS SCALE TOO. Vol_longS and adx_smoothS are lengths in
+// bars just like the ATR and DI periods; converting only the headline number
+// and leaving the smoothing at its M5 value would change the indicator, not
+// just its timeframe.
+//
+// THE LONG SIDE STAYS ON M5 -- it fits:
+//     atr_longL 4,904   and   adx_len + adx_smooth = 3,418 + 1,432 = 4,850
+// Both are under 5,000, but BOTH ARE OVER THE 300-BAR DEFAULT, so the strategy
+// declaration must set max_bars_back = 5000 or Pine will silently produce
+// wrong values on the long side while the short side looks fine.
+// =============================================================================
+
+// ---- 1. RAISE THE BUFFER IN YOUR strategy() DECLARATION ----------------
+//
+//     max_bars_back = 5000        // was 1000; atr_longL needs 4904
+//
+// -----------------------------------------------------------------------
+
+// ---- 2. SHORT-SIDE INPUTS, IN H1 BARS ---------------------------------
+atr_longS_h1     = input.int(758, "atr_longS   (H1 bars, was 9093 on M5)")
+Vol_longS_h1     = input.int(92,  "Vol_longS   (H1 bars, was 1109 on M5)")
+adx_lenS_h1      = input.int(213, "adx_lenS    (H1 bars, was 2557 on M5)")
+adx_smoothS_h1   = input.int(359, "adx_smoothS (H1 bars, was 4308 on M5)")
+adxVarS          = input.float(30.546, "adxVarS")
+
+// ---- 3. LONG SIDE -- unchanged, still native M5 ------------------------
+atr_longL = input.int(4904, "atr_longL")
+Vol_longL = input.int(229,  "Vol_longL")
+adx_len   = input.int(3418, "adx_len")
+adx_smooth = input.int(1432, "adx_smooth")
+adxVar    = input.float(1.114, "adxVar")
+
+atrL = ta.atr(atr_longL)
+volatility_gateL = atrL > ta.sma(atrL, Vol_longL)
+
+[plus_di, minus_di, adx_value] = ta.dmi(adx_len, adx_smooth)
+trend_is_active = adx_value > adxVar
+
+// ---- 4. SHORT SIDE -- computed on H1 ----------------------------------
+//
+// Wrapped in functions rather than inlined into request.security so each
+// ta.atr / ta.dmi is evaluated ONCE. Inlining `ta.atr(n) > ta.sma(ta.atr(n), m)`
+// computes the ATR twice.
+//
+// barmerge.lookahead_off is REQUIRED. With lookahead_on the H1 value for a
+// bar that has not closed yet leaks backwards into earlier M5 bars, which
+// backtests beautifully and cannot be traded.
+
+f_volGateS() =>
+    a = ta.atr(atr_longS_h1)
+    a > ta.sma(a, Vol_longS_h1)
+
+f_adxS() =>
+    [pS, mS, adxS] = ta.dmi(adx_lenS_h1, adx_smoothS_h1)
+    adxS
+
+volatility_gateS = request.security(syminfo.tickerid, "60", f_volGateS(),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+adx_valueS = request.security(syminfo.tickerid, "60", f_adxS(),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+trend_is_activeS = adx_valueS < adxVarS
+
+// ---- 5. SIGNALS --------------------------------------------------------
+// All four filter variables are computed at global scope above, so v6's lazy
+// `and` evaluation cannot skip a ta.* call on the right-hand side.
+
+longSignal  = rsiCrossUp and buyEntry  and sqzUp   and (LSMAS > LSMAL)
+              and volatility_gateL and trend_is_active
+shortSignal = rsiCrossDn and sellEntry and sqzDown and (SSMAS < SSMAL)
+              and volatility_gateS and trend_is_activeS
+
+// ---- 6. DIAGNOSTICS ----------------------------------------------------
+// If the H1 series fails to load, request.security returns na, and in v6 a na
+// bool becomes FALSE -- so the short side silently stops trading rather than
+// erroring. Plot these and confirm they are not flat zero before trusting a
+// backtest that shows few or no shorts.
+D = display.data_window
+plot(na(adx_valueS) ? 0 : 1,        "d_h1_loaded",  display=D)
+plot(adx_valueS,                    "d_adxS_h1",    display=D)
+plot(volatility_gateS ? 1 : 0,      "d_volGateS",   display=D)
+plot(trend_is_activeS ? 1 : 0,      "d_adxGateS",   display=D)
+plot(volatility_gateL ? 1 : 0,      "d_volGateL",   display=D)
+plot(trend_is_active ? 1 : 0,       "d_adxGateL",   display=D)

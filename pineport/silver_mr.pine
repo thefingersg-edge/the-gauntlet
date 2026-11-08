@@ -1,0 +1,179 @@
+//@version=6
+// =============================================================================
+// XAGUSD Gold-Residual Mean Reversion + Logistic Meta-Filter
+//
+// Line-for-line parity with silver_mr.py. Every calculation here has a direct
+// counterpart in the Python scaffold. Paste the coefficients printed by
+// silver_mr.py into the META-MODEL section below.
+//
+// PARITY RULES (violate these and the two will diverge):
+//   1. request.security uses lookahead_off + the SAME timeframe as the chart
+//   2. no volume-based inputs (spot CFD tick volume is broker-specific)
+//   3. calc_on_every_tick = false -> bar-close decisions only, like the backtest
+//   4. Python must be run on YOUR broker's XAGUSD feed, not a generic one
+// =============================================================================
+
+strategy("XAG Gold-Residual MR", overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     initial_capital=100000, commission_type=strategy.commission.percent,
+     commission_value=0.0, slippage=0, calc_on_every_tick=false,
+     process_orders_on_close=true, margin_long=0, margin_short=0)
+
+// ---------------------------------------------------------------- INPUTS ----
+grpS = "Signal"
+betaWin   = input.int(96,  "Beta window (bars)",        group=grpS)
+zWin      = input.int(96,  "Residual z-score window",   group=grpS)
+entryZ    = input.float(2.0, "Entry |z|", step=0.1,     group=grpS)
+
+grpR = "Regime gate"
+erWin     = input.int(20,  "Efficiency ratio window",   group=grpR)
+erMax     = input.float(0.35, "Max efficiency ratio", step=0.01, group=grpR)
+volWin    = input.int(480, "Vol percentile window",     group=grpR)
+volLo     = input.float(15, "Min vol percentile",       group=grpR)
+volHi     = input.float(90, "Max vol percentile",       group=grpR)
+sessStart = input.int(7,   "Session start (UTC hour)",  group=grpR)
+sessEnd   = input.int(16,  "Session end (UTC hour)",    group=grpR)
+
+grpB = "Barriers"
+atrWin    = input.int(14,  "ATR length",                group=grpB)
+tpAtr     = input.float(1.0, "Take profit (ATR)", step=0.1, group=grpB)
+slAtr     = input.float(1.5, "Stop loss (ATR)",   step=0.1, group=grpB)
+maxHold   = input.int(12,  "Time stop (bars)",          group=grpB)
+
+grpM = "Meta-model"
+useMeta   = input.bool(true, "Use logistic filter",     group=grpM)
+probThr   = input.float(0.58, "Min P(win)", step=0.01,  group=grpM)
+
+grpC = "Costs"
+spreadUsd = input.float(0.08, "Round-trip spread ($/oz)", step=0.01, group=grpC)
+
+// ------------------------------------------------------- EXTERNAL SERIES ----
+// lookahead_off is mandatory. With lookahead_on this backtests beautifully and
+// loses money live, because it reads the future.
+xau = request.security("OANDA:XAUUSD", timeframe.period, close,
+     lookahead=barmerge.lookahead_off)
+dxy = request.security("TVC:DXY", timeframe.period, close,
+     lookahead=barmerge.lookahead_off)
+
+// ------------------------------------------------------------- FEATURES ----
+rAg = math.log(close / close[1])
+rAu = math.log(xau / xau[1])
+rDx = math.log(dxy / dxy[1])
+
+// --- 1. rolling beta of silver on gold, then the residual -------------------
+// cov(x,y) = E[xy] - E[x]E[y]
+covAgAu = ta.sma(rAg * rAu, betaWin) - ta.sma(rAg, betaWin) * ta.sma(rAu, betaWin)
+varAu   = ta.sma(rAu * rAu, betaWin) - math.pow(ta.sma(rAu, betaWin), 2)
+beta    = varAu != 0 ? math.max(0.5, math.min(4.0, covAgAu / varAu)) : 1.8
+
+resid    = rAg - beta * rAu
+cumResid = math.sum(resid, betaWin)
+residZ   = ta.stdev(cumResid, zWin) != 0
+     ? (cumResid - ta.sma(cumResid, zWin)) / ta.stdev(cumResid, zWin) : 0.0
+
+// --- 2. gold/silver ratio dislocation ---------------------------------------
+gsr  = xau / close
+gsrZ = ta.stdev(gsr, zWin) != 0 ? (gsr - ta.sma(gsr, zWin)) / ta.stdev(gsr, zWin) : 0.0
+
+// --- 3. dollar impulse ------------------------------------------------------
+dxImp = math.sum(rDx, 8)
+dxyZ  = ta.stdev(dxImp, zWin) != 0 ? (dxImp - ta.sma(dxImp, zWin)) / ta.stdev(dxImp, zWin) : 0.0
+
+// --- 4. oscillator ----------------------------------------------------------
+rsiDev = (ta.rsi(close, 14) - 50) / 50
+
+// --- 5. Kaufman efficiency ratio (trend vs chop) ----------------------------
+direction = math.abs(close - close[erWin])
+volatility = math.sum(math.abs(close - close[1]), erWin)
+er = volatility != 0 ? direction / volatility : 0.0
+
+// --- 6. volatility regime ---------------------------------------------------
+atrV   = ta.atr(atrWin)
+atrPct = atrV / close
+volPct = ta.percentrank(atrPct, volWin)
+
+// --- 7. stretch from anchor, in ATR units -----------------------------------
+distEmaAtr = atrV != 0 ? (close - ta.ema(close, 48)) / atrV : 0.0
+
+// --- 8. gold lead-lag -------------------------------------------------------
+xauLead = atrPct != 0 ? math.sum(rAu, 3) / atrPct : 0.0
+
+// --- 9/10. time of day ------------------------------------------------------
+hrf     = hour(time, "UTC") + minute(time, "UTC") / 60.0
+hourSin = math.sin(2 * math.pi * hrf / 24)
+hourCos = math.cos(2 * math.pi * hrf / 24)
+
+// ============================================================================
+// META-MODEL -- REPLACE THESE WITH YOUR OWN OUTPUT FROM silver_mr.py
+// The Python script prints mean coefficients AND their std across folds.
+// Any feature whose std exceeds its mean is unstable: set its coefficient to 0
+// rather than shipping it.
+// ============================================================================
+// standardisation (mu / sd from the training folds)
+MU  = array.from(0.00,  0.00,  0.00,  0.00,  0.20,  50.0,  0.00,  0.00,  0.00,  0.00)
+SD  = array.from(1.00,  1.00,  1.00,  0.30,  0.12,  28.0,  1.50,  2.00,  0.70,  0.70)
+COEF= array.from(0.269, 0.410, -0.089, 0.069, -0.009, 0.448, -0.003, -0.022, 0.003, -0.009)
+INTERCEPT = -0.078
+
+featRaw = array.from(residZ, gsrZ, dxyZ, rsiDev, er, volPct, distEmaAtr, xauLead, hourSin, hourCos)
+
+logit = INTERCEPT
+for i = 0 to array.size(featRaw) - 1
+    z = (array.get(featRaw, i) - array.get(MU, i)) / array.get(SD, i)
+    logit += z * array.get(COEF, i)
+pWin = 1.0 / (1.0 + math.exp(-logit))
+
+// ------------------------------------------------------------ THE GATE -----
+inSession = hour(time, "UTC") >= sessStart and hour(time, "UTC") < sessEnd
+regimeOk  = inSession and er < erMax and volPct >= volLo and volPct <= volHi
+metaOk    = not useMeta or pWin >= probThr
+
+// Sign flip: the meta-model is trained on P(win) for the primary signal's side,
+// so it filters rather than directs. Direction comes from residZ only.
+longSig  = regimeOk and metaOk and residZ <= -entryZ
+shortSig = regimeOk and metaOk and residZ >=  entryZ
+
+flat = strategy.position_size == 0
+
+if longSig and flat
+    strategy.entry("L", strategy.long)
+if shortSig and flat
+    strategy.entry("S", strategy.short)
+
+// ------------------------------------------------------- EXIT MANAGEMENT ---
+// ATR is frozen at entry so the bracket does not drift with intrabar vol.
+var float entryAtr = na
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entryAtr := atrV
+
+if strategy.position_size > 0
+    ep = strategy.position_avg_price
+    strategy.exit("L-x", "L", limit = ep + tpAtr * entryAtr - spreadUsd / 2,
+                                stop = ep - slAtr * entryAtr - spreadUsd / 2)
+if strategy.position_size < 0
+    ep = strategy.position_avg_price
+    strategy.exit("S-x", "S", limit = ep - tpAtr * entryAtr + spreadUsd / 2,
+                                stop = ep + slAtr * entryAtr + spreadUsd / 2)
+
+// time stop -- mean reversion that has not worked in maxHold bars was wrong
+if strategy.position_size != 0
+     and (bar_index - strategy.opentrades.entry_bar_index(0)) >= maxHold
+    strategy.close_all("time")
+
+// ------------------------------------------------------------- VISUALS -----
+plotshape(longSig  and flat, "long",  shape.triangleup,   location.belowbar,
+     color.new(color.teal, 0), size=size.tiny)
+plotshape(shortSig and flat, "short", shape.triangledown, location.abovebar,
+     color.new(color.maroon, 0), size=size.tiny)
+
+bgcolor(regimeOk ? color.new(color.blue, 94) : na, title="regime on")
+
+plot(residZ,  "resid z", color.new(color.orange, 0), display=display.data_window)
+plot(pWin,    "P(win)",  color.new(color.lime, 0),   display=display.data_window)
+plot(volPct,  "vol pct", color.new(color.gray, 0),   display=display.data_window)
+plot(beta,    "beta",    color.new(color.purple, 0), display=display.data_window)
+
+// --------------------------------------------------------- PARITY CHECK ----
+// Export these four series to CSV from TradingView and diff them against the
+// Python DataFrame. If residZ matches to ~1e-6 you have parity. If it does not,
+// the culprit is almost always the XAUUSD feed differing from your Python source.

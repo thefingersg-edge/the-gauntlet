@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------- credentials
+# Nothing here has ever held a key; keep it that way.
+.env
+.env.*
+*.pem
+*.key
+.oanda_token
+.leonardo_env
+*_token
+*_secret*
+credentials*
+# ------------------------------------------------------------------ price data
+# Vendor bars are not redistributable. See DATA.md.
+data/
+**/data/
+*.csv
+!REGISTRY.csv
+# derived event logs -- our own detections, not vendor bars
+!pineport/adaptive/b1_events.csv
+!pineport/adaptive/b2_events.csv
+!pineport/adaptive/l1_candlespace.csv
+# -------------------------------------------------------------------- outputs
+results/
+out/
+build/
+generated_media/
+*.mp4
+*.mov
+*.wav
+*.mp3
+*.raw
+*.tgz
+*.tar.gz
+*.zip
+# ------------------------------------------------------------------- python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+# -------------------------------------------------------------------- scratch
+*.bak
+*.bak-*
+*.log
+*.FAILED
+_to_delete/
+.DS_Store
+Thumbs.db

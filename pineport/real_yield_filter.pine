@@ -1,0 +1,112 @@
+//@version=5
+// =============================================================================
+// Real-yield regime filter — drop-in snippet for the repaired strategy
+//
+// Gold pays no yield, so its opportunity cost is the real interest rate. The
+// gold-bullish state is a FALLING real yield — the INVERSE of the price
+// filter's "above its moving average". Getting that backwards is the easiest
+// mistake here and it will silently halve your trade count.
+//
+// Backtested result (PREREGISTRATION.md, test 2): beat the 4H price macro
+// filter in 5 of 6 walk-forward windows when used as a REPLACEMENT for it.
+// Using both together was rejected (2/6) — they are substitutes, not
+// complements. So `rate_mode = "replace"` is the tested configuration.
+//
+// -----------------------------------------------------------------------------
+// PASTE INSTRUCTIONS
+//
+// This is a fragment, not a standalone script. It references `macro_bullish`,
+// which the host strategy defines from the 4H price filter. Pasting it into an
+// empty chart window gives "Undeclared identifier: macro_bullish".
+//
+//   1. Paste everything between the INPUTS and COMBINATION markers into
+//      RSI_Boll_Squeeze_repaired.pine, immediately AFTER the line
+//          macro_bullish = higher_tf_close_l > higher_tf_sma_l
+//   2. In the long entry condition, replace `macro_bullish` with
+//      `macro_confirmed`.
+//
+// -----------------------------------------------------------------------------
+// WHY THERE IS NO MANUAL LAG INPUT (this was a bug in the first version)
+//
+// An earlier draft used `close[rate_lag]` inside request.security() to shift
+// for FRED's publication delay. Two problems:
+//
+//   * Pine rejects a variable history offset inside request.security(), which
+//     is the "unrecognised [rate_lag]" error — and because that line then fails
+//     to compile, every later use of real_yield_ma reports as undeclared too.
+//
+//   * It was not needed. `barmerge.lookahead_off` on a "D" request already
+//     means an intraday bar can only see the last CLOSED daily bar. During
+//     day D you get day D-1. That IS the one-day lag; adding another
+//     double-counted it.
+//
+// The Python backtest applies exactly one business day, so this matches it.
+// (Robustness check: lags of 0, 1, 2, 3 and 5 days all score 4-5/6 — the
+// result does not depend on this choice, which is what rules out a lookahead
+// artefact.)
+// -----------------------------------------------------------------------------
+
+// ---------------------------------------------------------------- INPUTS ----
+use_rate_filter = input.bool(true,  "Use real-yield regime filter",
+     tooltip="Gold rises when real yields fall. Requires the 10Y TIPS yield to " +
+             "be below its own moving average.")
+rate_symbol     = input.string("FRED:DFII10", "Real yield series",
+     options=["FRED:DFII10", "FRED:DFII5"],
+     tooltip="DFII10 = 10Y TIPS (real) yield — the tested series. DFII5 = 5Y, " +
+             "more Fed-sensitive. Do NOT use a nominal yield such as DGS10 " +
+             "unless you subtract breakevens yourself.")
+rate_sma_len    = input.int(20, "Real yield MA length (days)", minval=2,
+     tooltip="20 mirrors the 4H macro filter's length. Not tuned. Tested " +
+             "plateau runs 10-50 days; it degrades at 5 and at 100.")
+rate_mode       = input.string("replace", "Combine with 4H macro filter",
+     options=["replace", "both"],
+     tooltip="'replace' is the tested configuration (5/6 windows). 'both' was " +
+             "rejected (2/6) — requiring both filters is over-restrictive.")
+
+// ------------------------------------------------------------- THE SERIES ----
+// One tuple request rather than two calls: half the security budget, and both
+// values are guaranteed to come from the same daily bar.
+//
+//   "D"                  FRED series are DAILY ONLY — there is no intraday
+//                        history. Requesting timeframe.period returns nothing.
+//   barmerge.gaps_off    carry the last value through US market holidays.
+//   barmerge.lookahead_off  MANDATORY. With lookahead_on you receive the daily
+//                        close from the start of the day, which on an hourly
+//                        chart is a time machine.
+[real_yield, real_yield_ma] = request.security(rate_symbol, "D",
+     [close, ta.sma(close, rate_sma_len)],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// Falling real yield == gold-bullish. Note this is BELOW the average, the
+// opposite of the price filter.
+rates_bullish = not na(real_yield) and not na(real_yield_ma) and
+                 real_yield < real_yield_ma
+
+// ------------------------------------------------------------- COMBINATION ----
+// `macro_bullish` comes from the host strategy's 4H price filter.
+macro_confirmed = not use_rate_filter ? macro_bullish :
+                   rate_mode == "replace" ? rates_bullish :
+                   (macro_bullish and rates_bullish)
+
+// Then in the long entry, swap `macro_bullish` for `macro_confirmed`:
+//
+//   if (ta.crossover(vrsiL, RSIoverSold) and ta.crossover(sourceL, BBlower))
+//       and sqzUp and ta.crossover(LSMAS, LSMAL) and macro_confirmed
+//       and trend_is_active and volatility_gate
+//       strategy.entry("long", strategy.long, qty = long_position_size)
+
+// ------------------------------------------------------------------ PLOTS ----
+plot(real_yield,    "Real yield (10Y TIPS)", color.orange, display=display.data_window)
+plot(real_yield_ma, "Real yield MA",         color.yellow, display=display.data_window)
+bgcolor(use_rate_filter and rates_bullish ? color.new(color.green, 92) : na,
+     title="Real yield falling (gold-supportive)")
+
+// ---------------------------------------------------------------- CHECKING ----
+// 1. Open FRED:DFII10 as its own chart first and confirm it has history across
+//    your backtest range. If it does not load standalone it will not load here.
+// 2. Open the Data Window and check "Real yield" shows a number, not n/a.
+// 3. Toggle `use_rate_filter` off and on. If the trade count does NOT change,
+//    the series is returning na and the filter is silently inert — the same
+//    class of bug as the original Keltner one.
+// 4. Expect the green background roughly half the time; the tested series was
+//    below its 20d average on 51.8% of bars.

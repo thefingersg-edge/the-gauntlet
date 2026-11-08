@@ -1,0 +1,287 @@
+//@version=5
+strategy("RSI Boll Squeeze Strategy", shorttitle="Gold 4hr New", overlay=true, initial_capital = 2000)
+
+riskPercent = 1
+current_equity = strategy.equity
+cashRisk= (current_equity * riskPercent) / 100
+
+// RSI
+RSIlengthL = input(1,title="RSI Period LengthL")
+RSIlengthS = input(3,title="RSI Period LengthS")
+RSIoverSold = input(49, title="Over Sold")
+RSIoverBought = input(43, title="Under Sold")
+price = close
+vrsiL = ta.rsi(price, RSIlengthL)
+vrsiS = ta.rsi(price, RSIlengthS)
+
+LSMAlengthL = input(3,title="LSMA Period LengthL")
+LSMAlengthS = input(1,title="LSMA Period LengthS")
+LSMAL = ta.sma(price, LSMAlengthL)
+LSMAS = ta.sma(price, LSMAlengthS)
+
+SSMAlengthL = input(3,title="SSMA Period LengthL")
+SSMAlengthS = input(13,title="SSMA Period LengthS")
+SSMAL = ta.sma(price, SSMAlengthL)
+SSMAS = ta.sma(price, SSMAlengthS)
+
+//atrVar = input(7, title="atr vol")
+//macroLength = input(50, title="Marco Length")
+//macro_volume = ta.atr(atrVar) > ta.sma(ta.atr(atrVar), macroLength)
+
+//atrVarS = input(7, title="atr vol Short")
+//macroLengthS = input(50, title="Marco Length Short")
+//macro_volumeS = ta.atr(atrVarS) < ta.sma(ta.atr(atrVarS), macroLengthS)
+
+//SMALong = input(85, title="SMA Long")
+//SMAPeriod = price > ta.sma(price, SMALong)
+
+//EMALong = input(2, title="EMA Long")
+//EMAPeriod = price > ta.ema(price, EMALong)
+
+SMAShort = input(2, title="SMA Short")
+SMAPeriodS = price < ta.sma(price, SMAShort)
+
+EMAShort = input(2, title="EMA Short")
+EMAPeriodS = price < ta.ema(price, EMAShort)
+
+// 1. Set the standard institutional lengths
+adx_len    = input.int(9, title="ADX DI Length")
+adx_smooth = input.int(45, title="ADX Smoothing Length")
+
+// 2. Extract +DI, -DI, and the ADX line correctly from ta.dmi()
+[plus_di, minus_di, adx_value] = ta.dmi(adx_len, adx_smooth)
+
+// 3. Define your Trend Power Switch (Threshold of 23)
+adxVar = input(21, title="adx var")
+trend_is_active = adx_value > adxVar
+
+// 1. Set the standard institutional lengths
+adx_lenS    = input.int(50, title="ADX DI LengthS")
+adx_smoothS = input.int(1, title="ADX Smoothing LengthS")
+
+// 2. Extract +DI, -DI, and the ADX line correctly from ta.dmi()
+[plus_diS, minus_diS, adx_valueS] = ta.dmi(adx_lenS, adx_smoothS)
+
+// 3. Define your Trend Power Switch (Threshold of 23)
+adxVarS = input(30, title="adx varS")
+trend_is_activeS = adx_valueS < adxVarS
+
+// Stop Loss Adjustments
+
+flexUp = input.float(0.95,"Limit Flex", step = 0.001)
+flexDown = input.float(0.95, "Loss Flex", step = 0.001)
+
+gapDown = input.float(0.995, "Gap reducer Down", step = 0.01)
+stopvalue_short_1 = input.float(1000000, "stop value Short", step = 0.01)
+
+gapUp = input.float(0.995, "Gap reducer Up", step = 0.01)
+stopvalue_long_1 = input.float(0, "stop value Long", step = 0.01)
+
+profitLineUp = input.float(1, "Profit Line Up", step = 1)
+profitLineDown = input.float(1, "Profit Line Down", step = 1)
+
+TraceLineUp = input.float(0.001, "Trace Line Up", step = 0.01)
+TraceLineDown = input.float(0.001, "Trace Line Down", step = 0.01)
+
+markUp = input(470, title="MarkUp")
+lockProfitUp = input(470, title="lockProfitUp")
+markDown = input(880, title="MarkDown")
+lockProfitDown = input(880, title="lockProfitDown")
+
+rangeL = input(950, title="Range Long")
+rangeS = input(340, title="Range Short")
+
+// Get price of initial entry in position
+initialEntryPrice = strategy.opentrades.entry_price(0)
+profitLockinUp = initialEntryPrice
+profitLockinDown = initialEntryPrice
+
+// Big Squeeze Varibles
+lengthL = input(90, title="BB Length L")
+lengthS = input(9, title="BB Length S")
+mult = input(2.0,title="BB MultFactor")
+lengthKCL=input(14, title="KC Length L")
+lengthKCS=input(5, title="KC Length S")
+multKC = input(2.5, title="KC MultFactor")
+longVal = input(-38, title="Long Condition Value")
+shortVal = input(42, title="Short Condition Value")
+useTrueRange = input.bool(true, title="Use TrueRange (KC)")
+
+// Calculate BB
+source1 = close
+
+basisL = ta.vwma(source1, lengthL)
+devL = multKC * ta.stdev(source1, lengthL)
+upperBB = basisL + devL
+
+basisS = ta.vwma(source1, lengthS)
+devS = multKC * ta.stdev(source1, lengthS)
+lowerBB = basisS - devS
+
+// Calculate KC
+range1 = useTrueRange ? ta.tr(true) : (high - low)
+maL = ta.vwma(source1, lengthKCL)
+maS = ta.vwma(source1, lengthKCS)
+rangemaL = ta.vwma(range1, lengthKCL)
+rangemaS = ta.vwma(range1, lengthKCS)
+
+upperKC = maL + rangemaL * multKC
+lowerKC = maS - rangemaS * multKC
+
+sqzOn  = (lowerBB > lowerKC) and (upperBB < upperKC)
+sqzOff = (lowerBB < lowerKC) and (upperBB > upperKC)
+noSqz  = (sqzOn == false) and (sqzOff == false)
+
+valL = ta.linreg(source1 - math.avg(math.avg(ta.highest(high, lengthKCL), ta.lowest(low, lengthKCL)),ta.vwma(close,lengthKCL)), lengthKCL,0)
+valS = ta.linreg(source1 - math.avg(math.avg(ta.highest(high, lengthKCS), ta.lowest(low, lengthKCS)),ta.vwma(close,lengthKCS)), lengthKCS,0)
+
+sqzUp = (sqzOn == true) and (valL > longVal)
+sqzDown = (sqzOn == true) and (valS < shortVal)
+barssqzUp = ta.barssince(sqzUp)
+barssqzDown = ta.barssince(sqzDown)
+
+// Limit Lines
+
+use_trailing_stop_loss = input.bool(title="Use Trailing Stop Loss?", defval=true)
+
+SL_percent_basedL = input.float(5.79, 'Loss % Stop MulitiplierL', minval = 0.0, step = 0.1)
+L_percent_basedL = input.float(3.14, 'Limit % Stop MulitiplierL', minval = 0.0, step = 0.1)
+r_ratioL = input.float(3, 'Risk Reward RatioL', minval = 0.0, step = 0.1)
+stop_loss_amountL = close * SL_percent_basedL/100
+
+SL_percent_basedS = input.float(3.93, 'Loss % Stop MulitiplierS', minval = 0.0, step = 0.1)
+L_percent_basedS = input.float(5.09, 'Limit % Stop MulitiplierS', minval = 0.0, step = 0.1)
+r_ratioS = input.float(3, 'Risk Reward RatioS', minval = 0.0, step = 0.1)
+stop_loss_amountS = close * SL_percent_basedS/100
+
+// Bollinger Bands Long
+BBlengthL = input.int(5, minval=1,title="Bollinger Period Length L")
+BBmultL = input.float(0.51, minval=0.001, maxval=50,title="Bollinger Bands Standard Deviation L")
+BBbasisL = ta.vwma(price, BBlengthL)
+BBdevL = BBmultL * ta.stdev(price, BBlengthL)
+BBlower = BBbasisL - BBdevL
+sourceL = close
+buyEntry = ta.crossover(sourceL, BBlower)
+plot(BBbasisL, title="Bollinger Bands SMA Basis Line")
+p2 = plot(BBlower,title="Bollinger Bands Lower Line")
+
+// Bollinger Bands Short
+BBlengthS = input.int(35, minval=1,title="Bollinger Period Length S")
+BBmultS = input.float(1.17, minval=0.001, maxval=50,title="Bollinger Bands Standard Deviation S")
+BBbasisS = ta.vwma(price, BBlengthS)
+BBdevS = BBmultS * ta.stdev(price, BBlengthS)
+BBupper = BBbasisS + BBdevS
+sourceS = close
+sellEntry = ta.crossunder(sourceS, BBupper)
+p1 = plot(BBupper, title="Bollinger Bands Upper Line")
+fill(p1, p2)
+
+// Trailing Stop Loss
+bought = strategy.position_size[0] > strategy.position_size[1]
+since_entry_long = ta.barssince(bought)
+sold = strategy.position_size[0] < strategy.position_size[1]
+since_entry_short = ta.barssince(sold)
+
+price_stop_long = 0.0
+price_stop_short = 10000000.0
+targetvalue_long_1 = 0.0
+targetvalue_short_1 = 0.0
+stopvalue_long = 0.0
+stopvalue_short = 0.0
+
+//Stop Loss and Target Price Long
+if(strategy.position_size>0)
+    stopvalue_long := close - stop_loss_amountL
+    targetvalue_long_1 := close[since_entry_long] + close[since_entry_long]*(L_percent_basedL/100)*r_ratioL
+    profitLockinUp := ((targetvalue_long_1 - initialEntryPrice)/profitLineUp)+ initialEntryPrice
+    if ta.crossover(close,targetvalue_long_1)
+        stopvalue_long := targetvalue_long_1* flexUp
+    if close > targetvalue_long_1
+        stopvalue_long_1 := price_stop_long + ((close - price_stop_long)* gapUp)
+    if close > profitLockinUp
+        stopvalue_long_1 := price_stop_long + ((close - price_stop_long)* (gapUp-TraceLineUp))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + markUp)
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp)
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*1)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*1))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*2)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*2))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*3)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*3))
+    if ta.crossover(close, strategy.opentrades.entry_price(strategy.opentrades - 1) + (markUp +(rangeL*4)))
+        stopvalue_long_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) + (lockProfitUp +(rangeL*4))
+    if close < profitLockinUp
+        profitLockinUp := 0
+    price_stop_long := math.max(stopvalue_long, price_stop_long[1],stopvalue_long_1, profitLockinUp)
+
+
+else
+    price_stop_long := 0.0
+
+//Stop Loss and Target Price Short
+if(strategy.position_size<0)
+    stopvalue_short := close + stop_loss_amountS
+    targetvalue_short_1 := close[since_entry_short] - close[since_entry_short]*(L_percent_basedS/100)*r_ratioS
+    profitLockinDown := initialEntryPrice - ((initialEntryPrice - targetvalue_short_1)/profitLineDown)
+    if ta.crossunder(close, targetvalue_short_1)
+        stopvalue_short:= targetvalue_short_1+((1-flexDown)*targetvalue_short_1)
+    if close < targetvalue_short_1
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close)* gapDown)
+    if close < profitLockinDown
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close)* (gapDown-TraceLineDown))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - markDown)
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown)
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*1)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*1))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*2)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*2))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*3)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*3))
+    if ta.crossunder(close, strategy.opentrades.entry_price(strategy.opentrades - 1) - (markDown +(rangeS*4)))
+        stopvalue_short_1 := strategy.opentrades.entry_price(strategy.opentrades - 1) - (lockProfitDown +(rangeS*4))
+    if close > profitLockinDown
+        profitLockinDown := 100000000
+    price_stop_short := math.min(stopvalue_short, price_stop_short[1],stopvalue_short_1, profitLockinDown)
+
+else
+    price_stop_short := 10000000.0
+
+// Strategy Triggers
+long_position_size = math.ceil((cashRisk / (50 * syminfo.pointvalue)*1))/1
+short_position_size = math.ceil((cashRisk / (50 * syminfo.pointvalue)*1))/1
+
+if (ta.crossover(vrsiL, RSIoverSold) and ta.crossover(sourceL, BBlower)) and sqzUp and (LSMAS > LSMAL) and trend_is_active //and EMAPeriod//and SMAPeriod//and macro_volume
+    strategy.entry("long", strategy.long, qty = long_position_size)
+else
+    strategy.cancel(id="long")
+
+if (ta.crossunder(vrsiS, RSIoverBought) and ta.crossunder(sourceS, BBupper)) and sqzDown and (SSMAS < SSMAL) and trend_is_activeS //and SMAPeriodS //and macro_volumeS
+    strategy.entry("short", strategy.short, qty = short_position_size)
+else
+    strategy.cancel(id="short")
+
+strategy.exit("long exit", from_entry = 'long', limit = targetvalue_long_1+10000, stop = price_stop_long, when = strategy.position_size > 0)
+strategy.exit("short exit", from_entry = 'short', limit = targetvalue_short_1-10000, stop = price_stop_short, when = strategy.position_size < 0)
+
+// Plot Lines
+
+P1 = plot(price_stop_long > 0 ? price_stop_long : na, "SL Long", color.red, style=plot.style_linebr)
+P2 = plot(price_stop_long > 0 ? targetvalue_long_1 : na, "Target Long", color.aqua, style=plot.style_linebr)
+
+P3 = plot(price_stop_short < 10000000.0 ? price_stop_short : na, "SL Short", color.red, style=plot.style_linebr)
+P4 = plot(price_stop_short < 10000000.0 ? targetvalue_short_1 : na, "Target Short", color.aqua, style=plot.style_linebr)
+
+P5 = plot(strategy.position_size>0 ? ((targetvalue_long_1 - initialEntryPrice)/profitLineUp)+ initialEntryPrice : na, "SL Long", color.green, style=plot.style_linebr)
+P6 = plot(strategy.position_size<0 ? initialEntryPrice - ((initialEntryPrice - targetvalue_short_1)/profitLineDown) : na, "SL Long", color.green, style=plot.style_linebr)
+P7 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + markUp : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P8 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - markDown : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P9 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*1)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P10 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*1)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P11 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*2)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P12 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*2)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P13 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*3)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P14 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*3)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P15 = plot(strategy.position_size>0 ? strategy.opentrades.entry_price(strategy.opentrades -1) + (markUp +(rangeL*4)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+P16 = plot(strategy.position_size<0 ? strategy.opentrades.entry_price(strategy.opentrades -1) - (markDown +(rangeS*4)) : na, "SL Long", color.rgb(175, 76, 157), style=plot.style_linebr)
+
+plotchar(strategy.opentrades)

@@ -1,0 +1,79 @@
+//@version=5
+// =============================================================================
+// CoT with an EXPLICIT CFTC code — diagnosis fix
+//
+// THE BUG IN THE ORIGINAL
+//   CFTCCode = cot.convertRootToCOTCode("Auto")
+//
+// "Auto" maps syminfo.root to a CFTC code. That works on a futures symbol
+// (GC1! -> root "GC" -> gold). OANDA:XAUUSD is a CFD: there is no futures
+// root to map. Combined with `ignore_invalid_symbol = true`, a failed
+// resolution returns silently instead of erroring, so the chart plots a
+// fallback series — the SAME one on every metals CFD.
+//
+// Verified: exports from OANDA:XAUUSD and OANDA:XAGUSD were IDENTICAL across
+// all nine COT columns over 10,271 overlapping days, max difference 0.00,
+// while the price columns differed correctly. Magnitudes (commercial shorts
+// peaking at 114,813) indicate the series was SILVER in both files.
+//
+// THE FIX: state the CFTC code explicitly. No auto-resolution, no silent
+// fallback. The code is visible in the settings, so what you exported is
+// never in doubt.
+//
+// CFTC legacy market codes:
+//   088691  GOLD            (COMEX)
+//   084691  SILVER          (COMEX)
+//   085692  COPPER          (COMEX)
+//   067651  CRUDE OIL WTI   (NYMEX)
+//   002602  CORN            (CBOT)
+//   099741  US DOLLAR INDEX (ICE)
+//
+// SANITY CHECK BEFORE TRUSTING ANY EXPORT
+//   Gold commercial shorts run roughly 200,000-400,000 contracts.
+//   Silver commercial shorts run roughly 60,000-120,000.
+//   If both symbols show the same numbers, the code is not being applied.
+// =============================================================================
+
+indicator("CoT (explicit CFTC code)", shorttitle="CoT-explicit", precision=0)
+
+import TradingView/LibraryCOT/2 as cot
+
+cftc = input.string("088691", "CFTC market code",
+     options=["088691", "084691", "085692", "067651", "002602", "099741"],
+     tooltip="088691 gold | 084691 silver | 085692 copper | 067651 WTI | " +
+             "002602 corn | 099741 USDX. Set this explicitly — do NOT rely " +
+             "on Auto, which fails silently on CFD symbols.")
+shortNeg = input.bool(true, "Show shorts as negative")
+sgn = shortNeg ? -1 : 1
+
+tid(metric, dir) =>
+    cot.COTTickerid(COTType="Legacy", CFTCCode=cftc, includeOptions=false,
+         metricName=metric, metricDirection=dir, metricType="All")
+
+// ignore_invalid_symbol stays FALSE: if the code is wrong we want a visible
+// error, not a silent fallback. That silence is what caused the original bug.
+cl = request.security(tid("Commercial Positions",    "Long"),  "1D", close)
+cs = request.security(tid("Commercial Positions",    "Short"), "1D", close)
+ll = request.security(tid("Noncommercial Positions", "Long"),  "1D", close)
+ls = request.security(tid("Noncommercial Positions", "Short"), "1D", close)
+sl = request.security(tid("Nonreportable Positions", "Long"),  "1D", close)
+ss = request.security(tid("Nonreportable Positions", "Short"), "1D", close)
+
+plot(cl,        "Commercials long",        color.new(color.blue, 70),  linewidth=2)
+plot(cs * sgn,  "Commercials short",       color.new(color.blue, 70),  linewidth=2)
+plot(cl - cs,   "Commercials net",         color.blue,                 linewidth=3)
+plot(ll,        "Large Speculators long",  color.new(color.red, 70))
+plot(ls * sgn,  "Large Speculators short", color.new(color.red, 70))
+plot(ll - ls,   "Large Speculators net",   color.red,                  linewidth=2)
+plot(sl,        "Small Speculators long",  color.new(color.green, 70))
+plot(ss * sgn,  "Small Speculators short", color.new(color.green, 70))
+plot(sl - ss,   "Small Speculators net",   color.green,                linewidth=2)
+hline(0, "Zero", color.gray, hline.style_dotted)
+
+// Label the active code on the chart so a screenshot or export is
+// self-identifying — the same principle as the VERSION banner that caught
+// the stale-file problem in the data layer.
+var label tag = na
+label.delete(tag)
+tag := label.new(bar_index, cl - cs, "CFTC " + cftc, style=label.style_label_left,
+     color=color.new(color.gray, 80), textcolor=color.gray, size=size.small)

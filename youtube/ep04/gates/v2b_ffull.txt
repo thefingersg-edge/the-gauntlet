@@ -1,0 +1,48 @@
+PER SLEEVE, our single cost model:
+  part A dip-buy           711 trades   mean net +0.5023%   gross +0.5810%   cost 0.0787%   ~+17.0%/yr on notional
+  part B overnight        8104 trades   mean net +0.0171%   gross +0.0493%   cost 0.0322%   ~+6.6%/yr on notional
+  combined (pooled)       8815 trades   mean net +0.0562%   gross +0.0922%   cost 0.0360%   ~+23.5%/yr on notional
+
+=== ARM F full spec (A + B) — cleared 6 of 8 ===
+    trades 8815  markets 3
+  [PASS] 1 SIGN CONSISTENCY
+          by_era: {'E1': 0.00076, 'E2': 0.00055, 'E3': 0.00047}
+          n_by_era: {'E1': 2463, 'E2': 3114, 'E3': 3128}
+  [FAIL] 2 BREADTH
+          positive: 3
+          traded: 3
+          universe: 21
+          positive_priced_only: 3 of 3
+          unpriced_excluded: none
+          per_market: {'de30eur': '+0.00038', 'nas100usd': '+0.00050', 'spx500usd': '+0.00469'}
+  [FAIL] 3 EFFECT SIZE
+          mean_net_per_trade: 0.00056
+          mean_gross_per_trade: 0.00092
+          mean_cost_per_trade: 0.00036
+          threshold: 0.002
+  [PASS] 4 SAMPLE
+          n: 8815
+          threshold: 200
+  [PASS] 5 ROBUSTNESS (primary: all params)
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: 0.00056
+          worst: enter=20 -> 0.00046 (83% of base)
+          all: [('sma_trend', 150, 0.00051, 0.9), ('sma_trend', 250, 0.00053, 0.947), ('rsi_entry', 15, 0.00048, 0.857), ('rsi_entry', 25, 0.00053, 0.935), ('rsi_exit', 52, 0.00048, 0.853), ('rsi_exit', 88, 0.00051, 0.909), ('limit_atr', 0.1875, 0.00056, 0.999), ('limit_atr', 0.3125, 0.00057, 1.013), ('atr_n', 15, 0.00058, 1.037), ('atr_n', 25, 0.00059, 1.047), ('stop_atr', 2.25, 0.00054, 0.964), ('stop_atr', 3.75, 0.00057, 1.01), ('time_limit', 8, 0.00055, 0.983), ('time_limit', 12, 0.00057, 1.006), ('enter', 12, 0.00054, 0.961), ('enter', 20, 0.00046, 0.826), ('exit', 7, 0.00064, 1.139), ('exit', 11, 0.00049, 0.879)]
+  [PASS] 5 ROBUSTNESS (secondary: session hours held)
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: 0.00056
+          worst: rsi_exit=52 -> 0.00048 (85% of base)
+          all: [('sma_trend', 150, 0.00051, 0.9), ('sma_trend', 250, 0.00053, 0.947), ('rsi_entry', 15, 0.00048, 0.857), ('rsi_entry', 25, 0.00053, 0.935), ('rsi_exit', 52, 0.00048, 0.853), ('rsi_exit', 88, 0.00051, 0.909), ('limit_atr', 0.1875, 0.00056, 0.999), ('limit_atr', 0.3125, 0.00057, 1.013), ('atr_n', 15, 0.00058, 1.037), ('atr_n', 25, 0.00059, 1.047), ('stop_atr', 2.25, 0.00054, 0.964), ('stop_atr', 3.75, 0.00057, 1.01), ('time_limit', 8, 0.00055, 0.983), ('time_limit', 12, 0.00057, 1.006)]
+  [PASS] 6 MATCHED CONTROL (daily sleeve only)
+          edge_vs_control: 0.00423
+          n_matched: 697
+          coverage: 98% of 711 trades
+          limitation: part B's 8,013 overnight trades are hourly and have no daily control pool; an hourly control would be needed, as built for ARM C. Its net edge is +0.001%/trade, so this cannot change the picture.
+  [PASS] 7 DAILY RISK
+          measured_daily_max_dd: -20.4%
+          claimed_by_strategy: -21.1%
+          resolution: daily close, open positions marked
+          tolerance: claim may understate by at most 25%
+
+    combined equity 10,000 -> 111,829   CAGR 12.2%   daily max DD -20.4%
+    it claimed: 12.6%/yr, 21.1% DD, 10,000 -> ~132,500

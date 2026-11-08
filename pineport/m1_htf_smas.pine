@@ -1,0 +1,99 @@
+// =============================================================================
+// M1 SLOW SMAs VIA request.security -- drop-in replacement block
+//
+// The M1 training returned two SMA lookbacks past Pine's 5000-bar ceiling:
+//
+//     LSMAlengthL   8,186 M1 bars = 5.7 days
+//     SSMAlengthL   8,723 M1 bars = 6.1 days
+//
+// Both are computed on H1 instead, at the SAME TIME HORIZON. An M1 bar count
+// converts as  bars / 60:
+//
+//     LSMAlengthL   8,186 -> 136 H1 bars   (8186/60 = 136.4)
+//     SSMAlengthL   8,723 -> 145 H1 bars   (8723/60 = 145.4)
+//
+// THE FAST LEGS STAY NATIVE M1 -- they fit under 5,000:
+//
+//     LSMAlengthS   1,065
+//     SSMAlengthS   1,760
+//
+// but BOTH ARE OVER THE 300-BAR DEFAULT, so max_bars_back must be raised or
+// Pine silently produces wrong values for the first few thousand bars while
+// the script compiles cleanly and the backtest looks fine.
+//
+// WHY MIXING TIMEFRAMES IS SOUND HERE. An SMA of 136 H1 closes averages every
+// 60th M1 close over the same 5.7-day window -- an unbiased subsample of the
+// same data, in the same price units, so comparing it against an M1-derived
+// SMA is valid. It is a slightly noisier estimate of the same mean, and over a
+// window this long the difference is negligible: the slow leg moves by less
+// than a tick per hour. The fast leg keeps full M1 resolution, which is where
+// crossover timing actually matters.
+// =============================================================================
+
+// ---- 1. RAISE THE BUFFER IN YOUR strategy() DECLARATION ----------------
+//
+//     max_bars_back = 2000        // covers SSMAlengthS = 1760, the longest
+//                                 // series still computed natively on M1.
+//                                 // 5000 also works but costs memory and
+//                                 // compile time for no benefit.
+//
+// -----------------------------------------------------------------------
+
+// ---- 2. SLOW LEGS, IN H1 BARS -----------------------------------------
+LSMAlengthL_h1 = input.int(136, "LSMAlengthL (H1 bars, was 8186 on M1)")
+SSMAlengthL_h1 = input.int(145, "SSMAlengthL (H1 bars, was 8723 on M1)")
+
+// ---- 3. FAST LEGS -- unchanged, still native M1 ------------------------
+LSMAlengthS    = input.int(1065, "LSMAlengthS")
+SSMAlengthS    = input.int(1760, "SSMAlengthS")
+
+LSMAS = ta.sma(close, LSMAlengthS)
+SSMAS = ta.sma(close, SSMAlengthS)
+
+// ---- 4. SLOW LEGS -- computed on H1 ------------------------------------
+//
+// Wrapped in functions rather than inlined so each ta.sma is evaluated once.
+//
+// barmerge.lookahead_off is REQUIRED. With lookahead_on the H1 value for a bar
+// that has not closed yet leaks backwards into earlier M1 bars, which backtests
+// beautifully and cannot be traded.
+
+f_LSMAL() => ta.sma(close, LSMAlengthL_h1)
+f_SSMAL() => ta.sma(close, SSMAlengthL_h1)
+
+LSMAL = request.security(syminfo.tickerid, "60", f_LSMAL(),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+SSMAL = request.security(syminfo.tickerid, "60", f_SSMAL(),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// ---- 5. SIGNALS --------------------------------------------------------
+// All four SMA variables are computed at global scope above, so v6's lazy
+// `and` evaluation cannot skip a ta.* call on the right-hand side.
+//
+// The M1 training kept (SSMAS < SSMAL) on the short side and rateGateLong.
+// Uncomment the legs the trained config actually calls for.
+
+smaGateLong  = LSMAS > LSMAL
+smaGateShort = SSMAS < SSMAL
+
+// longSignal  := rsiCrossUp  and buyEntry  and sqzUp   and smaGateLong  and rateGateLong
+// shortSignal := rsiCrossDn  and sellEntry and sqzDown and smaGateShort
+
+// ---- 6. DIAGNOSTICS ----------------------------------------------------
+// If the H1 series fails to load, request.security returns na, and in v6 a na
+// bool becomes FALSE -- so the gate silently blocks every trade rather than
+// erroring. Plot these and confirm d_h1_loaded is 1 and the SMA values are in
+// the right price range before trusting a backtest that shows few trades.
+//
+// SANITY CHECK: d_LSMAL_h1 and d_SSMAL_h1 should sit within a few dollars of
+// each other and track price with a multi-day lag. If either reads 0, na, or
+// something far from spot, the substitution is not working.
+D = display.data_window
+plot(na(LSMAL) ? 0 : 1,      "d_h1_loaded",  display=D)
+plot(LSMAL,                  "d_LSMAL_h1",   display=D)
+plot(SSMAL,                  "d_SSMAL_h1",   display=D)
+plot(LSMAS,                  "d_LSMAS_m1",   display=D)
+plot(SSMAS,                  "d_SSMAS_m1",   display=D)
+plot(smaGateLong  ? 1 : 0,   "d_smaGateL",   display=D)
+plot(smaGateShort ? 1 : 0,   "d_smaGateS",   display=D)

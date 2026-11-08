@@ -1,0 +1,70 @@
+
+=== ARM D (v3 trend + index MR) — cleared 2 of 7 ===
+    trades 2835  markets 19
+  [FAIL] 1 SIGN CONSISTENCY
+          by_era: {'E1': 0.0052, 'E2': -0.00384, 'E3': 0.00149}
+          n_by_era: {'E1': 737, 'E2': 1041, 'E3': 1057}
+  [FAIL] 2 BREADTH
+          positive: 8
+          traded: 19
+          universe: 21
+          per_market: {'audusd': -0.00405, 'bcousd': 0.01817, 'cornusd': 0.00204, 'de10ybeur': -0.00192, 'de30eur': 0.00018, 'eurusd': -0.00214, 'gbpusd': -0.00601, 'nas100usd': 0.0028, 'natgasusd': -0.00862, 'spx500usd': 0.00158, 'sugarusd': -0.00048, 'usb10yusd': -0.0039, 'usdcad': -0.00421, 'usdjpy': -9e-05, 'wheatusd': -0.0099, 'xagusd': 0.00851, 'xauusd': 0.00783, 'xcuusd': 0.01151, 'xptusd': -0.00718}
+  [FAIL] 3 EFFECT SIZE
+          mean_net_per_trade: 0.0005
+          mean_gross_per_trade: 0.0036
+          mean_cost_per_trade: 0.0031
+          threshold: 0.002
+  [PASS] 4 SAMPLE
+          n: 2835
+          threshold: 200
+  [FAIL] 5 ROBUSTNESS
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: 0.0005
+          worst: h3=315 -> -0.00021 (-42% of base)
+          all: [('h1', 47, 0.00066, 1.326), ('h1', 79, 0.00082, 1.649), ('h2', 94, 0.00049, 0.977), ('h2', 158, 5e-05, 0.103), ('h3', 189, 0.00044, 0.878), ('h3', 315, -0.00021, -0.415), ('atr_n', 15, 0.00068, 1.365), ('atr_n', 25, 0.00026, 0.525), ('stop_atr', 3.75, 0.00085, 1.719), ('stop_atr', 6.25, 0.00089, 1.796), ('cooldown', 8, 0.00028, 0.571), ('cooldown', 12, 0.00028, 0.558), ('warmup', 190, 0.0005, 1.009), ('warmup', 316, 0.00026, 0.53), ('b_sma', 150, 0.00041, 0.815), ('b_sma', 250, 0.00049, 0.976), ('b_ibs', 0.15, 0.00051, 1.03), ('b_ibs', 0.25, 0.00044, 0.875), ('b_stop_atr', 3.0, 0.00052, 1.043), ('b_stop_atr', 5.0, 0.00044, 0.882), ('b_time', 4, 0.00032, 0.653), ('b_time', 6, 0.00059, 1.194)]
+  [FAIL] 6 MATCHED CONTROL
+          edge_vs_control: -0.00331
+          n_matched: 2573
+          coverage: 91% of 2835 trades
+  [PASS] 7 DAILY RISK
+          measured_daily_max_dd: -30.1%
+          claimed_by_strategy: -30.0%
+          resolution: daily close, open positions marked
+          tolerance: claim may understate by at most 25%
+
+    equity 10,000 -> 16,859   CAGR 2.5%   daily max DD -30.1%
+
+=== ARM E (twin sleeve) — cleared 1 of 7 ===
+    trades 2069  markets 21
+  [FAIL] 1 SIGN CONSISTENCY
+          by_era: {'E1': 0.00956, 'E2': -0.0073, 'E3': -0.00139}
+          n_by_era: {'E1': 584, 'E2': 774, 'E3': 711}
+  [FAIL] 2 BREADTH
+          positive: 7
+          traded: 21
+          universe: 21
+          per_market: {'audusd': -0.00323, 'bcousd': 0.02659, 'cornusd': -0.00568, 'de10ybeur': -0.00629, 'de30eur': 0.00151, 'eurgbp': -0.00745, 'eurjpy': -0.00206, 'eurusd': -0.0038, 'gbpusd': -0.00496, 'nas100usd': 0.00768, 'natgasusd': -0.03678, 'spx500usd': 0.00452, 'sugarusd': 0.00119, 'usb10yusd': -0.00636, 'usdcad': -0.00812, 'usdjpy': -0.00253, 'wheatusd': -0.01347, 'xagusd': -0.00184, 'xauusd': 0.02811, 'xcuusd': -0.00193, 'xptusd': 0.00673}
+  [FAIL] 3 EFFECT SIZE
+          mean_net_per_trade: -0.00051
+          mean_gross_per_trade: 0.00563
+          mean_cost_per_trade: 0.00614
+          threshold: 0.002
+  [PASS] 4 SAMPLE
+          n: 2069
+          threshold: 200
+  [FAIL] 5 ROBUSTNESS
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: -0.00051
+          note: not applicable: base edge is not positive
+  [FAIL] 6 MATCHED CONTROL
+          edge_vs_control: 0.01123
+          n_matched: 285
+          coverage: 14% of 2069 trades
+          note: NOT DETERMINABLE: too few trades could be matched. An always-in-market strategy leaves no control bars.
+  [FAIL] 7 DAILY RISK
+          measured_daily_max_dd: -35.1%
+          claimed_by_strategy: -20.0%
+          resolution: daily close, open positions marked
+          tolerance: claim may understate by at most 25%
+
+    equity 10,000 -> 14,785   CAGR 1.9%   daily max DD -35.1%

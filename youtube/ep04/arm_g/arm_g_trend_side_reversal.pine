@@ -1,0 +1,172 @@
+//@version=6
+// ARM G — Trend-side liquidity reversal (daily bars)
+// Specification: ARM_G_SPEC_trend_side_reversal.md (same folder). Parameters below are FROZEN.
+// Run one chart per instrument (OANDA symbols), daily timeframe.
+// Limits of this script versus the spec:
+//   * Pine runs one instrument per chart, so the portfolio rule (gross notional cap of 4x equity,
+//     ranked by |z|) cannot be applied here. Gates 1-6 are defined on the uncapped per-market trade
+//     list, which is what this script produces.
+//   * Costs are NOT taken out of the Strategy Tester P&L. The table (top right) charges each closed
+//     trade the brief's measured round-trip spread plus 2.5%/yr financing per calendar night.
+strategy("ARM G - Trend-side liquidity reversal (daily)", shorttitle = "ARM G", overlay = true,
+     initial_capital = 10000, currency = currency.USD, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.0,
+     margin_long = 5, margin_short = 5, calc_on_every_tick = false, process_orders_on_close = false)
+
+// ---------- Frozen parameters (spec section 6) ----------
+L     = input.int(4,      "L  return lookback, bars",            minval = 1, group = "Frozen parameters")
+V     = input.int(60,     "V  volatility window, bars",          minval = 2, group = "Frozen parameters")
+T     = input.int(200,    "T  trend window, bars",               minval = 2, group = "Frozen parameters")
+K     = input.float(2.0,  "K  entry threshold, z",               step = 0.05, group = "Frozen parameters")
+H     = input.int(5,      "H  holding period, bars",             minval = 1, group = "Frozen parameters")
+M     = input.float(3.0,  "M  disaster-stop multiple",           step = 0.1, group = "Frozen parameters")
+B     = input.float(0.20, "B  daily vol budget, % of equity",    step = 0.01, group = "Frozen parameters")
+CAP   = input.float(1.0,  "Max notional per position, x equity", step = 0.1, group = "Frozen parameters")
+QSTEP = input.float(0.0001, "Unit increment used for rounding",  group = "Sizing")
+FIN   = input.float(2.5,  "Financing, %/yr per calendar night",  group = "Costs")
+SOVR  = input.float(0.0,  "Round-trip spread override (fraction, 0 = use table)", step = 0.00001, group = "Costs")
+START = input.time(timestamp("01 Jan 2005 00:00 +0000"), "Take signals from", group = "Window")
+
+// Timeframe: daily bars only. The table shows a red warning on any other timeframe.
+isDaily = timeframe.isdaily and timeframe.multiplier == 1
+
+// ---------- Measured round-trip spreads (EP04_BRIEF.md) ----------
+spreadFor(string t) =>
+    switch t
+        "EURUSD"    => 0.00028
+        "GBPUSD"    => 0.00028
+        "USDJPY"    => 0.00021
+        "USDCAD"    => 0.00026
+        "AUDUSD"    => 0.00039
+        "EURGBP"    => 0.00032
+        "EURJPY"    => 0.00028
+        "XAUUSD"    => 0.00032
+        "XAGUSD"    => 0.00124
+        "XPTUSD"    => 0.00333
+        "XCUUSD"    => 0.00079
+        "SPX500USD" => 0.00015
+        "NAS100USD" => 0.00016
+        "DE30EUR"   => 0.00022
+        "BCOUSD"    => 0.00088
+        "NATGASUSD" => 0.00435
+        "USB10YUSD" => 0.00046
+        "DE10YBEUR" => 0.00023
+        "CORNUSD"   => 0.00464
+        "WHEATUSD"  => 0.00373
+        "SUGARUSD"  => 0.00289
+        => na
+
+spread = SOVR > 0 ? SOVR : spreadFor(str.upper(syminfo.ticker))
+
+// ---------- Signal (spec section 3) ----------
+r1    = math.log(close / close[1])
+sigma = ta.stdev(r1, V)                  // population standard deviation (divide by V)
+rL    = math.log(close / close[L])
+z     = sigma > 0 ? rL / (sigma * math.sqrt(L)) : na
+trend = ta.sma(close, T)
+flat  = strategy.position_size == 0
+inWin = time >= START
+
+longSig  = inWin and flat and not na(z) and not na(trend) and z <= -K and close > trend
+shortSig = inWin and flat and not na(z) and not na(trend) and z >=  K and close < trend
+
+// ---------- Sizing (spec section 5) ----------
+fx = request.currency_rate(syminfo.currency, "USD", ignore_invalid_currency = true)
+float qty = 0.0
+if not na(fx) and not na(sigma) and sigma > 0
+    unitV = close * syminfo.pointvalue * fx            // USD notional of one unit
+    if unitV > 0
+        notional = math.min((B / 100.0) * strategy.equity / sigma, CAP * strategy.equity)
+        qty := math.floor(notional / unitV / QSTEP) * QSTEP
+
+// ---------- Orders (spec section 4) ----------
+// Signal on the close of bar t; the entry fills at the open of bar t+1.
+// The disaster stop is fixed from the signal close and is live from the entry bar.
+if longSig and qty > 0
+    strategy.entry("Long", strategy.long, qty = qty)
+    strategy.exit("Long stop", from_entry = "Long", stop = close * (1.0 - M * sigma * math.sqrt(H)))
+if shortSig and qty > 0
+    strategy.entry("Short", strategy.short, qty = qty)
+    strategy.exit("Short stop", from_entry = "Short", stop = close * (1.0 + M * sigma * math.sqrt(H)))
+
+// Time exit: the entry fills at the open of bar E; at the close of bar E+H-1, close everything,
+// so it fills at the open of bar E+H (H full bars held).
+if strategy.position_size != 0 and strategy.opentrades > 0
+    if bar_index - strategy.opentrades.entry_bar_index(0) >= H - 1
+        strategy.close_all(comment = "Time exit")
+        strategy.cancel("Long stop")
+        strategy.cancel("Short stop")
+
+// ---------- Cost-charged per-trade record, by era ----------
+eraOf(int t) =>
+    t < timestamp("UTC", 2012, 4, 1, 0, 0) ? 0 : t < timestamp("UTC", 2019, 7, 1, 0, 0) ? 1 : t < timestamp("UTC", 2026, 9, 1, 0, 0) ? 2 : 3
+
+var int   done = 0
+var float sG   = 0.0
+var float sC   = 0.0
+var int   nStp = 0
+var array<float> eNet = array.new_float(4, 0.0)
+var array<int>   eN   = array.new_int(4, 0)
+
+while done < strategy.closedtrades
+    i      = done
+    ep     = strategy.closedtrades.entry_price(i)
+    xp     = strategy.closedtrades.exit_price(i)
+    d      = strategy.closedtrades.size(i) > 0 ? 1.0 : -1.0
+    nights = math.round((strategy.closedtrades.exit_time(i) - strategy.closedtrades.entry_time(i)) / 86400000.0)
+    g      = d * (xp / ep - 1.0)
+    c      = nz(spread) + (FIN / 100.0) / 365.0 * nights
+    k      = eraOf(strategy.closedtrades.entry_time(i))
+    sG    += g
+    sC    += c
+    array.set(eNet, k, array.get(eNet, k) + (g - c))
+    array.set(eN,   k, array.get(eN, k) + 1)
+    if str.contains(strategy.closedtrades.exit_id(i), "stop")
+        nStp += 1
+    done += 1
+
+pct(float x) => na(x) ? "n/a" : str.tostring(x * 100.0, "#.###") + "%"
+avg(float s, int n) => n > 0 ? s / n : na
+
+var table tb = table.new(position.top_right, 2, 13, bgcolor = color.new(color.black, 15), border_width = 1)
+if barstate.islast
+    n   = done
+    eAvg0 = avg(array.get(eNet, 0), array.get(eN, 0))
+    eAvg1 = avg(array.get(eNet, 1), array.get(eN, 1))
+    eAvg2 = avg(array.get(eNet, 2), array.get(eN, 2))
+    eAvg3 = avg(array.get(eNet, 3), array.get(eN, 3))
+    netAll = avg(sG - sC, n)
+    g1 = not na(eAvg0) and not na(eAvg1) and not na(eAvg2) and ((eAvg0 > 0 and eAvg1 > 0 and eAvg2 > 0) or (eAvg0 < 0 and eAvg1 < 0 and eAvg2 < 0))
+    tc = color.white
+    table.cell(tb, 0, 0,  "ARM G  " + syminfo.ticker + (isDaily ? "" : "  WRONG TIMEFRAME - use 1D"), text_color = isDaily ? tc : color.red)
+    table.cell(tb, 1, 0,  "spread " + (na(spread) ? "UNKNOWN - set override" : pct(spread)), text_color = na(spread) ? color.red : tc)
+    table.cell(tb, 0, 1,  "Trades", text_color = tc)
+    table.cell(tb, 1, 1,  str.tostring(n) + "  (stopped " + str.tostring(nStp) + ")", text_color = tc)
+    table.cell(tb, 0, 2,  "Gross / trade", text_color = tc)
+    table.cell(tb, 1, 2,  pct(avg(sG, n)), text_color = tc)
+    table.cell(tb, 0, 3,  "Cost / trade", text_color = tc)
+    table.cell(tb, 1, 3,  pct(avg(sC, n)), text_color = tc)
+    table.cell(tb, 0, 4,  "Net / trade", text_color = tc)
+    table.cell(tb, 1, 4,  pct(netAll), text_color = na(netAll) ? tc : netAll > 0 ? color.lime : color.red)
+    table.cell(tb, 0, 5,  "E1 net (2005-01 to 2012-03)", text_color = tc)
+    table.cell(tb, 1, 5,  pct(eAvg0) + "  n=" + str.tostring(array.get(eN, 0)), text_color = tc)
+    table.cell(tb, 0, 6,  "E2 net (2012-04 to 2019-06)", text_color = tc)
+    table.cell(tb, 1, 6,  pct(eAvg1) + "  n=" + str.tostring(array.get(eN, 1)), text_color = tc)
+    table.cell(tb, 0, 7,  "E3 net (2019-07 to 2026-08)", text_color = tc)
+    table.cell(tb, 1, 7,  pct(eAvg2) + "  n=" + str.tostring(array.get(eN, 2)), text_color = tc)
+    table.cell(tb, 0, 8,  "After E3 (unseen)", text_color = tc)
+    table.cell(tb, 1, 8,  pct(eAvg3) + "  n=" + str.tostring(array.get(eN, 3)), text_color = tc)
+    table.cell(tb, 0, 9,  "Gate 1 (this market): same sign E1-E3", text_color = tc)
+    table.cell(tb, 1, 9,  g1 ? "yes" : "no", text_color = g1 ? color.lime : color.red)
+    table.cell(tb, 0, 10, "Gate 3 (this market): net >= 0.20%", text_color = tc)
+    table.cell(tb, 1, 10, not na(netAll) and netAll >= 0.002 ? "yes" : "no", text_color = tc)
+    table.cell(tb, 0, 11, "Gates 2, 4, 5, 6, 7", text_color = tc)
+    table.cell(tb, 1, 11, "pooled over 21 markets - not computable on one chart", text_color = color.gray)
+    table.cell(tb, 0, 12, "Tester P&L", text_color = tc)
+    table.cell(tb, 1, 12, "GROSS of costs - use this table", text_color = color.gray)
+
+// ---------- Display ----------
+plot(trend, "Trend SMA", color = color.orange)
+plotshape(longSig and qty > 0,  "Long signal",  shape.triangleup,   location.belowbar, color.teal, size = size.tiny)
+plotshape(shortSig and qty > 0, "Short signal", shape.triangledown, location.abovebar, color.red,  size = size.tiny)

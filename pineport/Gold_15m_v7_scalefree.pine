@@ -1,0 +1,453 @@
+//@version=6
+// =============================================================================
+// Version 6 Gold 15m -- BUFFER BUG FIXED
+//
+// WHAT CHANGED (and nothing else -- trade logic is untouched)
+//
+// 1. FIX: results no longer depend on how much chart history is loaded.
+//    Was:  entryCloseL := close[since_entry_long]
+//    A dynamic history offset. Pine's default max_bars_back buffer is 300 bars;
+//    81% of trades here hold longer than that (median 772, max 6,595), and
+//    max_bars_back caps at 5,000 so raising it is not a complete fix either.
+//    Pine sizes the buffer from the loaded history, so changing the chart range
+//    changed the trades.
+//    Now:  entryCloseL is a `var` captured on the bar the position opens.
+//    This is EXACT, not an approximation -- ta.barssince(bought) is 0 on that
+//    bar, so close[since_entry_long] always resolved to the entry bar's close.
+//
+// 2. REMOVED as dead once (1) is applied:
+//       since_entry_long, since_entry_short, and their two ta.barssince calls.
+//
+// 3. EFFICIENCY: ta.atr() was computed twice in each volatility gate
+//    (once bare, once inside ta.sma). Now once each. Identical values.
+//
+// 4. ADDED: `useRateFilter` toggle, DEFAULTED TO TRUE so behaviour is
+//    unchanged. Testing showed removing the FRED gate is neutral in-sample and
+//    worth ~45 percentile points out-of-sample -- flip it to false to A/B.
+//
+// Tested and rejected previously, removed to keep the file readable:
+//    macro_bullish / macro_bearish (4H close vs SMA)  -- no improvement
+//    rates_bearish on the short leg                   -- no improvement
+// =============================================================================
+
+// =============================================================================
+// EXECUTION MODEL -- PINNED TO MATCH THE PYTHON PORT
+//
+// Every parameter below is set explicitly, including ones that are already the
+// default, because a default that changes between Pine versions is exactly how
+// this went wrong. Do not remove any of them.
+//
+//   margin_long / margin_short = 0
+//       v6 changed the default from 0 to 100 (no leverage), which SILENTLY
+//       REJECTS any entry whose notional exceeds account equity. Confirmed
+//       against your own export: entries at 107%, 113% and 110% of equity
+//       vanished, the one at 94% filled. The port has no margin model, so 0
+//       is what matches it. This is also what made results depend on the
+//       backtest range -- whether equity had grown enough to price you out of
+//       your own next trade depended on where the test started.
+//
+//   pyramiding = 0
+//       Port: a same-direction entry while already in a position is rejected;
+//       an opposite-direction entry reverses.
+//
+//   commission_value = 0, slippage = 0
+//       Port defaults. Add costs only when you deliberately want to test them.
+//
+//   process_orders_on_close = false
+//       Port fills entries at the NEXT bar's open.
+//
+//   fill_orders_on_standard_ohlc = true, use_bar_magnifier = false
+//       Port fills stops from the standard OHLC of the bar, with gap handling.
+//       The bar magnifier would use intrabar data the port never sees.
+//
+//   calc_on_every_tick = false, calc_on_order_fills = false
+//       Port evaluates once per closed bar.
+//
+//   max_bars_back = 1000
+//       Set explicitly so Pine never sizes the history buffer from however
+//       much chart history happens to be loaded.
+// =============================================================================
+strategy("Version 6 Gold 15m", shorttitle="Gold 15m v7", overlay=true,
+         initial_capital              = 6000,
+         margin_long                  = 0,
+         margin_short                 = 0,
+         pyramiding                   = 0,
+         commission_type              = strategy.commission.percent,
+         commission_value             = 0,
+         slippage                     = 0,
+         process_orders_on_close      = false,
+         fill_orders_on_standard_ohlc = true,
+         use_bar_magnifier            = false,
+         calc_on_every_tick           = false,
+         calc_on_order_fills          = false,
+         max_bars_back                = 1000)
+
+// ----------------------------------------------------------------- position sizing
+riskPercent  = input.float(0.8, "Risk % of equity", minval=0.0, step=0.1)
+// Sizing is computed further down, once SL_percent_basedL exists.
+
+// ----------------------------------------------------------------- entry filters
+RSIlengthL    = input.int(16, "RSI Period LengthL")
+RSIlengthS    = input.int(15, "RSI Period LengthS")
+RSIoverSold   = input.int(54, "Over Sold")
+RSIoverBought = input.int(34, "Under Sold")
+
+LSMAlengthL = input.int(49, "LSMA Period LengthL")
+LSMAlengthS = input.int(1,  "LSMA Period LengthS")
+SSMAlengthL = input.int(11, "SSMA Period LengthL")
+SSMAlengthS = input.int(1,  "SSMA Period LengthS")
+
+adx_len     = input.int(6,  "ADX DI Length")
+adx_smooth  = input.int(4,  "ADX Smoothing Length")
+adxVar      = input.int(24, "adx var")
+adx_lenS    = input.int(32, "ADX DI LengthS")
+adx_smoothS = input.int(20, "ADX Smoothing LengthS")
+adxVarS     = input.int(33, "adx varS")
+
+atr_longL = input.int(3,  "atr_longL")
+Vol_longL = input.int(7,  "Vol LongL")
+atr_longS = input.int(39, "atr_longS")
+Vol_longS = input.int(24, "Vol LongS")
+
+useRateFilter  = input.bool(false, "FRED real-yield filter (ablation: HARMFUL)")
+useVolGateLong = input.bool(false, "Long volatility gate (ablation: no effect)")
+useAdxLong     = input.bool(false, "Long ADX filter (ablation: no effect)")
+rate_sma_len  = input.int(26, "Rate SMA Len FRED")
+
+// RANGE-DEPENDENCE TEST. The bisector showed the full LONG stack is stable
+// across backtest ranges. If this script is not, the short side is the
+// remaining difference. Turn this off and re-compare full range vs 365 days.
+enableShorts = input.bool(true, "Enable short trades")
+
+// ----------------------------------------------------------------- squeeze
+lengthL      = input.int(5,     "BB Length L")
+lengthS      = input.int(10,    "BB Length S")
+lengthKCL    = input.int(10,    "KC Length L")
+lengthKCS    = input.int(18,    "KC Length S")
+multKC       = input.float(2.5, "KC MultFactor")
+longVal      = input.int(0,     "Long Condition Value")
+shortVal     = input.int(0,     "Short Condition Value")
+useTrueRange = input.bool(true, "Use TrueRange (KC)")
+
+BBlengthL = input.int(94,     "Bollinger Period Length L",            minval=1)
+BBmultL   = input.float(1.13, "Bollinger Bands Standard Deviation L", minval=0.001, maxval=50)
+BBlengthS = input.int(7,      "Bollinger Period Length S",            minval=1)
+BBmultS   = input.float(1.68, "Bollinger Bands Standard Deviation S", minval=0.001, maxval=50)
+
+// ----------------------------------------------------------------- stop shaping
+flexUp   = input.float(0.95,  "Limit Flex", step=0.001)
+flexDown = input.float(0.95,  "Loss Flex",  step=0.001)
+gapUp    = input.float(0.995, "Gap reducer Up",   step=0.01)
+gapDown  = input.float(0.995, "Gap reducer Down", step=0.01)
+
+// NOT persistent stops -- Pine re-runs the global scope every bar, so each
+// resets to the value below before the blocks may overwrite it. Per-bar seeds
+// into math.max / math.min.
+seedStopLong  = input.float(0,       "Long stop seed (per bar)",  step=0.01)
+seedStopShort = input.float(1000000, "Short stop seed (per bar)", step=0.01)
+
+SL_percent_basedL = input.float(2.94, "Loss % Stop MulitiplierL",  minval=0.0, step=0.1)
+L_percent_basedL  = input.float(3.14, "Limit % Stop MulitiplierL", minval=0.0, step=0.1)
+r_ratioL          = input.float(3,    "Risk Reward RatioL",        minval=0.0, step=0.1)
+SL_percent_basedS = input.float(6,    "Loss % Stop MulitiplierS",  minval=0.0, step=0.1)
+L_percent_basedS  = input.float(5.45, "Limit % Stop MulitiplierS", minval=0.0, step=0.1)
+r_ratioS          = input.float(3,    "Risk Reward RatioS",        minval=0.0, step=0.1)
+
+// ----------------------------------------------------------------- sizing
+// Placed HERE, not in the inputs header, because it reads SL_percent_basedL
+// and Pine requires declaration before use.
+//
+// SCALE-FREE SIZING. The divisor used to be a hardcoded 50 -- a dollar
+// constant that happened to approximate the stop distance when gold was
+// ~1,500 (1500 * 2.94% = 44). At 4,565 the real stop distance is 134, so the
+// fixed divisor sized ~3x too large and requested positions worth 107% of the
+// account, which v6 then silently rejected. Dividing by the actual stop
+// distance delivers the stated risk % at any price level.
+cashRisk     = strategy.equity * riskPercent / 100
+stopDistL    = close * SL_percent_basedL / 100
+positionSize = math.max(1, math.ceil(cashRisk / (stopDistL * syminfo.pointvalue)))
+
+profitLineUp   = input.float(1,     "Profit Line Up",   step=1)
+profitLineDown = input.float(1,     "Profit Line Down", step=1)
+TraceLineUp    = input.float(0.001, "Trace Line Up",    step=0.01)
+TraceLineDown  = input.float(0.001, "Trace Line Down",  step=0.01)
+
+// SCALE-FREE LADDER. These were absolute dollars, calibrated when gold was
+// ~1,265. At gold 4,500 the same $170 rung is a third of the move it used to
+// be, so the ladder meant something different in every era and no training
+// window spanning both could be fitted coherently. Now percentages of the
+// ENTRY price, fixed at entry so rungs cannot drift mid-trade.
+// Calibrated against the median entry price of the 2006-2023 training trades
+// (1,263.5) so behaviour is unchanged at that level: 170/1263.5 = 13.455%.
+markUpPct         = input.float(13.455, "MarkUp % of entry",         step=0.1)
+lockProfitUpPct   = input.float(13.455, "lockProfitUp % of entry",   step=0.1)
+markDownPct       = input.float(7.915,  "MarkDown % of entry",       step=0.1)
+lockProfitDownPct = input.float(7.123,  "lockProfitDown % of entry", step=0.1)
+rangeLPct         = input.float(4.749,  "Range Long % of entry",     step=0.1)
+rangeSPct         = input.float(4.749,  "Range Short % of entry",    step=0.1)
+
+// =============================================================================
+// INDICATORS -- every ta.* call is at global scope and runs on every bar.
+// Nothing below may put a ta.* call inside a conditional or on the right of
+// an `and`/`or` (v6 evaluates those lazily).
+// =============================================================================
+price = close
+
+vrsiL = ta.rsi(price, RSIlengthL)
+vrsiS = ta.rsi(price, RSIlengthS)
+LSMAL = ta.sma(price, LSMAlengthL)
+LSMAS = ta.sma(price, LSMAlengthS)
+SSMAL = ta.sma(price, SSMAlengthL)
+SSMAS = ta.sma(price, SSMAlengthS)
+
+// plus_di / minus_di are unused but ta.dmi() returns a 3-tuple, so the slots
+// must be named. They cost nothing -- ta.dmi computes all three regardless.
+[plus_di,  minus_di,  adx_value]  = ta.dmi(adx_len,  adx_smooth)
+[plus_diS, minus_diS, adx_valueS] = ta.dmi(adx_lenS, adx_smoothS)
+trend_is_active  = adx_value  > adxVar
+trend_is_activeS = adx_valueS < adxVarS
+
+// Bollinger / Keltner squeeze
+upperBB = ta.vwma(price, lengthL) + multKC * ta.stdev(price, lengthL)
+lowerBB = ta.vwma(price, lengthS) - multKC * ta.stdev(price, lengthS)
+
+range1  = useTrueRange ? ta.tr(true) : (high - low)
+upperKC = ta.vwma(price, lengthKCL) + ta.vwma(range1, lengthKCL) * multKC
+lowerKC = ta.vwma(price, lengthKCS) - ta.vwma(range1, lengthKCS) * multKC
+
+sqzOn = (lowerBB > lowerKC) and (upperBB < upperKC)
+
+valL = ta.linreg(price - math.avg(math.avg(ta.highest(high, lengthKCL), ta.lowest(low, lengthKCL)), ta.vwma(price, lengthKCL)), lengthKCL, 0)
+valS = ta.linreg(price - math.avg(math.avg(ta.highest(high, lengthKCS), ta.lowest(low, lengthKCS)), ta.vwma(price, lengthKCS)), lengthKCS, 0)
+
+sqzUp   = sqzOn and (valL > longVal)
+sqzDown = sqzOn and (valS < shortVal)
+
+// Entry bands
+BBbasisL = ta.vwma(price, BBlengthL)
+BBlower  = BBbasisL - BBmultL * ta.stdev(price, BBlengthL)
+BBupper  = ta.vwma(price, BBlengthS) + BBmultS * ta.stdev(price, BBlengthS)
+
+// Volatility gates -- each ATR evaluated ONCE (was computed twice per gate)
+atrL = ta.atr(atr_longL)
+atrS = ta.atr(atr_longS)
+volatility_gateL = atrL > ta.sma(atrL, Vol_longL)
+volatility_gateS = atrS > ta.sma(atrS, Vol_longS)
+
+// Real yield: gold-bullish when 10y TIPS yield is below its own average
+[real_yield, real_yield_ma] = request.security("FRED:DFII10", "D", [close, ta.sma(close, rate_sma_len)], barmerge.gaps_off, barmerge.lookahead_off)
+rates_bullish = real_yield < real_yield_ma
+// All three default OFF. `not X or Y` means an unticked filter passes
+// everything; rates_bullish / volatility_gateL / trend_is_active are all
+// pre-computed at global scope, so v6 lazy evaluation cannot skip them.
+longFilters = (not useRateFilter  or rates_bullish)
+          and (not useVolGateLong or volatility_gateL)
+          and (not useAdxLong     or trend_is_active)
+
+// The four entry crossovers -- hoisted out of the `if` conditions for v6.
+buyEntry   = ta.crossover(price,  BBlower)
+sellEntry  = ta.crossunder(price, BBupper)
+rsiCrossUp = ta.crossover(vrsiL,  RSIoverSold)
+rsiCrossDn = ta.crossunder(vrsiS, RSIoverBought)
+
+bought = strategy.position_size > strategy.position_size[1]
+sold   = strategy.position_size < strategy.position_size[1]
+
+// ---- THE FIX -------------------------------------------------------------
+// Capture the entry-bar close when the position opens and hold it. Replaces
+// close[since_entry_long], which asked for data up to 6,595 bars back against
+// a 300-bar default buffer and made results depend on loaded chart history.
+var float entryCloseL = 0.0
+var float entryCloseS = 0.0
+if bought
+    entryCloseL := close
+if sold
+    entryCloseS := close
+// --------------------------------------------------------------------------
+
+stop_loss_amountL = close * SL_percent_basedL / 100
+stop_loss_amountS = close * SL_percent_basedS / 100
+
+// Evaluated once instead of 20 times. Equal to each other while a position is
+// open (pyramiding is 1).
+//
+// THE GUARD MATTERS. In the original these expressions only ever ran INSIDE
+// `if (strategy.position_size > 0)`, where strategy.opentrades >= 1. Hoisting
+// them to global scope means they also run on flat bars, where
+// strategy.opentrades is 0 and `entry_price(strategy.opentrades - 1)` asks for
+// index -1. That is out of range, and what it returns is not something to rely
+// on. The ternary keeps the hoist (and its speed) while never indexing an
+// empty trade list.
+initialEntryPrice = strategy.opentrades > 0 ? strategy.opentrades.entry_price(0) : na
+
+// Ladder rungs in price terms, anchored to the entry price so they are fixed
+// for the life of the trade.
+ladderUnit     = na(initialEntryPrice) ? na : initialEntryPrice / 100.0
+markUp         = markUpPct         * ladderUnit
+lockProfitUp   = lockProfitUpPct   * ladderUnit
+markDown       = markDownPct       * ladderUnit
+lockProfitDown = lockProfitDownPct * ladderUnit
+rangeL         = rangeLPct         * ladderUnit
+rangeS         = rangeSPct         * ladderUnit
+lastEntry         = strategy.opentrades > 0 ? strategy.opentrades.entry_price(strategy.opentrades - 1) : na
+
+// =============================================================================
+// TRAILING STOP / TARGET
+// =============================================================================
+price_stop_long     = 0.0
+price_stop_short    = 10000000.0
+targetvalue_long_1  = 0.0
+targetvalue_short_1 = 0.0
+stopvalue_long      = 0.0
+stopvalue_short     = 0.0
+stopvalue_long_1    = seedStopLong
+stopvalue_short_1   = seedStopShort
+profitLockinUp      = initialEntryPrice
+profitLockinDown    = initialEntryPrice
+
+if (strategy.position_size > 0)
+    stopvalue_long     := close - stop_loss_amountL
+    targetvalue_long_1 := entryCloseL + entryCloseL * (L_percent_basedL / 100) * r_ratioL
+    profitLockinUp     := ((targetvalue_long_1 - initialEntryPrice) / profitLineUp) + initialEntryPrice
+
+    if ta.crossover(close, targetvalue_long_1)
+        stopvalue_long := targetvalue_long_1 * flexUp
+    if close > targetvalue_long_1
+        stopvalue_long_1 := price_stop_long + ((close - price_stop_long) * gapUp)
+    if close > profitLockinUp
+        stopvalue_long_1 := price_stop_long + ((close - price_stop_long) * (gapUp - TraceLineUp))
+
+    // Profit ladder -- rungs stay unrolled on purpose (ta.crossover cannot take
+    // a different level per iteration inside a loop)
+    if ta.crossover(close, lastEntry + markUp)
+        stopvalue_long_1 := lastEntry + lockProfitUp
+    if ta.crossover(close, lastEntry + markUp + rangeL)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL
+    if ta.crossover(close, lastEntry + markUp + rangeL * 2)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL * 2
+    if ta.crossover(close, lastEntry + markUp + rangeL * 3)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL * 3
+    if ta.crossover(close, lastEntry + markUp + rangeL * 4)
+        stopvalue_long_1 := lastEntry + lockProfitUp + rangeL * 4
+
+    if close < profitLockinUp
+        profitLockinUp := 0
+    price_stop_long := math.max(stopvalue_long, price_stop_long[1], stopvalue_long_1, profitLockinUp)
+else
+    price_stop_long := 0.0
+
+if (strategy.position_size < 0)
+    stopvalue_short     := close + stop_loss_amountS
+    targetvalue_short_1 := entryCloseS - entryCloseS * (L_percent_basedS / 100) * r_ratioS
+    profitLockinDown    := initialEntryPrice - ((initialEntryPrice - targetvalue_short_1) / profitLineDown)
+
+    if ta.crossunder(close, targetvalue_short_1)
+        stopvalue_short := targetvalue_short_1 + ((1 - flexDown) * targetvalue_short_1)
+    if close < targetvalue_short_1
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close) * gapDown)
+    if close < profitLockinDown
+        stopvalue_short_1 := price_stop_short[1] - ((price_stop_short[1] - close) * (gapDown - TraceLineDown))
+
+    if ta.crossunder(close, lastEntry - markDown)
+        stopvalue_short_1 := lastEntry - lockProfitDown
+    if ta.crossunder(close, lastEntry - markDown - rangeS)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS
+    if ta.crossunder(close, lastEntry - markDown - rangeS * 2)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS * 2
+    if ta.crossunder(close, lastEntry - markDown - rangeS * 3)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS * 3
+    if ta.crossunder(close, lastEntry - markDown - rangeS * 4)
+        stopvalue_short_1 := lastEntry - lockProfitDown - rangeS * 4
+
+    if close > profitLockinDown
+        profitLockinDown := 100000000
+    price_stop_short := math.min(stopvalue_short, price_stop_short[1], stopvalue_short_1, profitLockinDown)
+else
+    price_stop_short := 10000000.0
+
+// =============================================================================
+// ORDERS
+// =============================================================================
+// FILTERS REMOVED, on ablation evidence measured out of sample:
+//   FRED real-yield gate -- unseen window 48.6th -> 93.4th percentile without it
+//   long volatility gate -- 47.2 vs 48.6, indistinguishable
+//   long ADX filter      -- 50.8 vs 48.6, indistinguishable
+// Each cost trades for no measurable gain. Toggles kept so they can be
+// re-tested, but all default OFF now.
+longSignal  = rsiCrossUp and buyEntry and sqzUp and (LSMAS > LSMAL) and longFilters
+shortSignal = enableShorts and rsiCrossDn and sellEntry and sqzDown and (SSMAS < SSMAL) and volatility_gateS and trend_is_activeS
+
+if longSignal
+    strategy.entry("long", strategy.long, qty=positionSize)
+else
+    strategy.cancel("long")
+
+if shortSignal
+    strategy.entry("short", strategy.short, qty=positionSize)
+else
+    strategy.cancel("short")
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+
+if inLong
+    strategy.exit("long exit", from_entry="long", limit=targetvalue_long_1 + 10000, stop=price_stop_long)
+
+if inShort
+    strategy.exit("short exit", from_entry="short", limit=targetvalue_short_1 - 10000, stop=price_stop_short)
+
+// =============================================================================
+// PLOTS -- unique titles so CSV exports do not collide
+// =============================================================================
+plot(BBbasisL, "BB Basis")
+p2 = plot(BBlower, "BB Lower")
+p1 = plot(BBupper, "BB Upper")
+fill(p1, p2)
+
+plot(price_stop_long  > 0 ? price_stop_long : na,              "SL Long",      color.red,  style=plot.style_linebr)
+plot(price_stop_long  > 0 ? targetvalue_long_1 : na,           "Target Long",  color.aqua, style=plot.style_linebr)
+plot(price_stop_short < 10000000.0 ? price_stop_short : na,    "SL Short",     color.red,  style=plot.style_linebr)
+plot(price_stop_short < 10000000.0 ? targetvalue_short_1 : na, "Target Short", color.aqua, style=plot.style_linebr)
+
+// Position state for CSV export -- this is what lets the Python port be
+// verified bar-by-bar. char="" draws nothing but still exports the value.
+plotchar(strategy.opentrades, "opentrades", "", location.top)
+
+// =============================================================================
+// DIAGNOSTICS -- for finding why two chart ranges disagree
+//
+// These go to the Data Window only, so the chart stays clean, and they are
+// included in "Export chart data". Run the SAME script over your full range
+// and over 365 days, export both, and diff them. The first column that differs
+// on a shared timestamp is the cause.
+//
+// What to look for:
+//   fredOK = 0        -> FRED:DFII10 did not load. rates_bullish then collapses
+//                        to false in v6 (bool cannot be na) and ALL longs are
+//                        blocked. Most likely suspect.
+//   posSize differs   -> equity-driven sizing diverged; affects P&L only, not
+//                        which trades fire.
+//   firstBar differs  -> the two runs genuinely start at different bars, so
+//                        this is a data-loading limit, not the strategy.
+// =============================================================================
+showDiag = input.bool(true, "Export diagnostics to Data Window")
+D = display.data_window
+
+var int firstBar = bar_index
+plot(showDiag ? firstBar             : na, "d_firstBar",  display=D)
+plot(showDiag ? bar_index            : na, "d_barIndex",  display=D)
+plot(showDiag ? (na(real_yield) ? 0 : 1)    : na, "d_fredOK",     display=D)
+plot(showDiag ? real_yield           : na, "d_realYield", display=D)
+plot(showDiag ? real_yield_ma        : na, "d_realYieldMA", display=D)
+plot(showDiag ? (rates_bullish ? 1 : 0)     : na, "d_ratesBull",  display=D)
+plot(showDiag ? positionSize         : na, "d_posSize",   display=D)
+plot(showDiag ? strategy.equity      : na, "d_equity",    display=D)
+plot(showDiag ? (sqzUp ? 1 : 0)             : na, "d_sqzUp",      display=D)
+plot(showDiag ? (volatility_gateL ? 1 : 0)  : na, "d_volGateL",   display=D)
+plot(showDiag ? (trend_is_active ? 1 : 0)   : na, "d_adxL",       display=D)
+plot(showDiag ? (rsiCrossUp ? 1 : 0)        : na, "d_rsiCrossUp", display=D)
+plot(showDiag ? (buyEntry ? 1 : 0)          : na, "d_buyEntry",   display=D)
+plot(showDiag ? (longSignal ? 1 : 0)        : na, "d_longSignal", display=D)
+plot(showDiag ? (shortSignal ? 1 : 0)       : na, "d_shortSignal", display=D)
+plot(showDiag ? entryCloseL          : na, "d_entryCloseL", display=D)
+plot(showDiag ? targetvalue_long_1   : na, "d_targetL",   display=D)

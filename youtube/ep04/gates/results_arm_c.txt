@@ -1,0 +1,41 @@
+
+=== ARM C (ORB first-hour -> last-hour) — cleared 6 of 9 ===
+    trades 6110  markets 2
+  [FAIL] 1 SIGN CONSISTENCY
+          by_era: {'E1': 7e-05, 'E2': -0.00032, 'E3': -0.0002}
+          n_by_era: {'E1': 1948, 'E2': 2070, 'E3': 2062}
+  [PASS] C2 SAMPLE
+          n: 6110
+          distinct_days: 3683
+          thresholds: 200 trades, 250 distinct days
+  [FAIL] C3 ROBUSTNESS (primary: session hours perturbed)
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: -0.00016
+          note: not applicable: base edge is not positive
+  [FAIL] C3 ROBUSTNESS (secondary: session hours held)
+          rule: +/-25% of each parameter's value
+          base_net_per_trade: -0.00016
+          note: not applicable: base edge is not positive
+  [PASS] C4 MATCHED CONTROL (+ time-of-day)
+          edge_vs_control: 0.000131
+          coverage: 99%
+  [PASS] C5 RISK RESOLUTION
+          resolution: entry bar (1h) — the strategy's own, not daily
+          max_adverse_excursion_mean: -0.2750%
+          max_adverse_excursion_worst: -10.489%
+          worse_than_close_on: 88% of trades
+          note: no sized equity curve is built for this arm: at daily resolution a strategy flat by 16:00 ET every day shows nothing, which is precisely why this gate measures at the strategy's own bar resolution instead
+  [PASS] C6 EXECUTION REALISM
+          cost_model: fixed before any arm was run; spread + financing
+          fills: entry at the 15:00 bar OPEN, signalled from the 09:00 bar CLOSE five hours earlier; stops filled at the stop price
+          note: its own assumption was ~1.3bp round trip vs our 3-4bp
+  [PASS] C7 NO INTRA-BAR LOOK-AHEAD
+          signal: prior day's 15:00 close and today's 09:00 close — both closed bars
+          caveat: the stop is checked against the entry bar's own low/high; a resting order, but the intrabar path is unknowable, so the stop price is assumed (conservative for a long)
+  [PASS] C8 SESSION INTEGRITY
+          verified: verify_h1.py — hourly bars are UTC by open, 100% match to daily on high/low/close over 5,591 sessions
+          defect_found: spx500usd hourly switches from +00:00 to NAIVE for its last 907 rows; continuity of price and hour confirms UTC. Handled, not assumed.
+
+    REPORTED, not gated:
+      breadth      0 of 2 traded markets agreed in sign (21 in the universe)
+      effect size  net -0.0158%/trade  gross +0.0192%  cost 0.0350%
